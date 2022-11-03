@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J samtools_bam_to_fastq
-#SBATCH -c 10                               # Request one core
-#SBATCH -t 0-0:20                         # Runtime in D-HH:MM format
+#SBATCH -c 8                               # Request one core
+#SBATCH -t 0-0:25                         # Runtime in D-HH:MM format
 #SBATCH -p short                           # Partition to run in
-#SBATCH --mem=80G                         # Memory total in MiB (for all cores)
+#SBATCH --mem=40G                         # Memory total in MiB (for all cores)
 #SBATCH -o logs/samtools_bam_to_fastq_%j.out                 # File to which STDOUT will be written, including job ID (%j)
 #SBATCH -e logs/samtools_bam_to_fastq_%j.err                 # File to which STDERR will be written, including job ID (%j)
 set -eux
@@ -11,6 +11,7 @@ set -eux
 module load samtools/1.15.1
 module load pigz/2.3.4
 
+# USAGE:
 # comm -1 -3 <(ls -1 fastq | grep _1.fastq.gz$ | sed s/_1.fastq.gz//g | sort | uniq) <(ls -1 raw | grep .bam$ | sed s/.bam//g | sort | uniq) |
 #  parallel sbatch bam_to_fastq.sh {}
 
@@ -18,11 +19,11 @@ module load pigz/2.3.4
 for i in $@
 do
 if [ ! -f "raw/${i}_sorted.bam" ]; then
-  samtools sort -n -@ 10 -m 5G -o "raw/${i}_sorted.bam" "raw/${i}.bam"
+  samtools sort -n -@ 8 -m 4G -o "raw/${i}_sorted.bam" "raw/${i}.bam"
 fi
 if [ ! -f "fastq/${i}_1.fastq.gz" ]; then
-  samtools fastq -1 >(pigz -p 4 -c > "fastq/${i}_1.fastq.gz") \
-    -2 >(pigz -p 4 -c > "fastq/${i}_2.fastq.gz") \
+  samtools fastq -1 >(pigz -p 3 -c > "fastq/${i}_1.fastq.gz") \
+    -2 >(pigz -p 3 -c > "fastq/${i}_2.fastq.gz") \
     -0 "fastq/${i}_weird.fastq" \
     -@ 4 "raw/${i}_sorted.bam"
 fi
