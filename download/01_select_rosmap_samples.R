@@ -93,6 +93,10 @@ rna_meta_eligible <- rna_meta %>%
 all(rna_meta_eligible$specimenID %in% fastq_df$specimen_id)
 
 fastq_df_selected <- fastq_df %>%
+  semi_join(
+    rna_meta_eligible,
+    by = c("specimen_id" = "specimenID")
+  ) %>%
   mutate(file_type = if_else(str_detect(file, "bam"), "bam", "fastq"))
 
 write_csv(
