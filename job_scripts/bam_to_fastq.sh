@@ -26,6 +26,7 @@ if [ ! -f "fastq/${i}_1.fastq.gz" ]; then
     -2 >(pigz -p 3 -c > "fastq/${i}_2.fastq.gz") \
     -0 "fastq/${i}_weird.fastq" \
     -@ 4 "raw/${i}_sorted.bam"
+  rm "raw/${i}_sorted.bam"
 fi
 done
 
