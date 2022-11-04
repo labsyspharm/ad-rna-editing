@@ -36,7 +36,7 @@ touch "quants/${PREFIX_FILE}.lock"
 # I'm using `cat` to concatenate them back together for alignment with salmon
 
 salmon quant -i "$1" -l A \
-  --seqBias --gcBias --posBias --recoverOrphans -p 5 \
+  --seqBias --gcBias --posBias -p 5 \
   -1 "${PREFIX_PATH}_1.fastq.gz" \
   -2 "${PREFIX_PATH}_2.fastq.gz" \
   -o "quants/${PREFIX_FILE}"
