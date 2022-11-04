@@ -11,6 +11,7 @@
 # comm -1 -3 <(ls -1 fastq | grep _1.fastq.gz$ | sed s/_1.fastq.gz//g | sort | uniq) <(ls -1 raw | grep .bam$ | grep -v sorted | sed s/.bam//g | sort | uniq) |
 #  parallel sbatch bam_to_fastq.sh {}
 
+module load gcc/9.2.0
 module load samtools/1.15.1
 module load pigz/2.3.4
 
