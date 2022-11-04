@@ -6,14 +6,15 @@
 #SBATCH --mem=40G                         # Memory total in MiB (for all cores)
 #SBATCH -o logs/samtools_bam_to_fastq_%j.out                 # File to which STDOUT will be written, including job ID (%j)
 #SBATCH -e logs/samtools_bam_to_fastq_%j.err                 # File to which STDERR will be written, including job ID (%j)
-set -eux
+
+# USAGE:
+# comm -1 -3 <(ls -1 fastq | grep _1.fastq.gz$ | sed s/_1.fastq.gz//g | sort | uniq) <(ls -1 raw | grep .bam$ | grep -v sorted | sed s/.bam//g | sort | uniq) |
+#  parallel sbatch bam_to_fastq.sh {}
 
 module load samtools/1.15.1
 module load pigz/2.3.4
 
-# USAGE:
-# comm -1 -3 <(ls -1 fastq | grep _1.fastq.gz$ | sed s/_1.fastq.gz//g | sort | uniq) <(ls -1 raw | grep .bam$ | sed s/.bam//g | sort | uniq) |
-#  parallel sbatch bam_to_fastq.sh {}
+set -eux
 
 # for i in SRR8571937  SRR8571938 SRR8571939 SRR8571940 SRR8571941 SRR8571942 SRR8571944 SRR8571945 SRR8571947 SRR8571948 SRR8571949 SRR8571950 SRR8571951 SRR8571952
 for i in $@
@@ -30,3 +31,4 @@ if [ ! -f "fastq/${i}_1.fastq.gz" ]; then
 fi
 done
 
+echo "done"
