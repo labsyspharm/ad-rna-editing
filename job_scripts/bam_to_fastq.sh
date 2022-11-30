@@ -20,7 +20,7 @@ set -eux
 # for i in SRR8571937  SRR8571938 SRR8571939 SRR8571940 SRR8571941 SRR8571942 SRR8571944 SRR8571945 SRR8571947 SRR8571948 SRR8571949 SRR8571950 SRR8571951 SRR8571952
 for i in $@
 do
-touch "fastq/${i}.lock"
+echo "$SLURM_JOB_ID" > "fastq/${i}.lock"
 if [ ! -f "raw/${i}_sorted.bam" ]; then
   samtools sort -n -@ 8 -m 4G -o "raw/${i}_sorted.bam" "raw/${i}.bam"
 fi
@@ -32,7 +32,7 @@ if [ ! -f "fastq/${i}_1.fastq.gz" ]; then
   rm "raw/${i}_sorted.bam"
 fi
 rm "fastq/${i}.lock"
-touch "fastq/${i}.done"
+echo "$SLURM_JOB_ID" > "fastq/${i}.done"
 done
 
 echo "done"
