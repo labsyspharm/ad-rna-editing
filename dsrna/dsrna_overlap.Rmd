@@ -1,0 +1,816 @@
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(GenomicRanges)
+library(powerjoin)
+library(qs)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader("~/data", .cache = TRUE)
+
+```
+
+```{r}
+#
+if (!file.exists("Homo_sapiens.GRCh38.111.chr.gtf.gz"))
+  download.file(
+    "ftp://ftp.ensembl.org/pub/release-111/gtf/homo_sapiens/Homo_sapiens.GRCh38.111.chr.gtf.gz",
+    "Homo_sapiens.GRCh38.111.chr.gtf.gz",
+    method = "curl"
+  )
+
+```
+
+```{r}
+ensembl_gtf <- rtracklayer::import(
+  "Homo_sapiens.GRCh38.111.chr.gtf.gz"
+)
+
+repeatmasker_raw <- syn("syn55256576") %>%
+  read_csv()
+
+repeatmasker_gr <- makeGRangesFromDataFrame(
+  repeatmasker_raw %>%
+    mutate(
+      across(chromosome, \(x) str_remove(x, "^chr")),
+      across(strand, \(x) str_replace(x, fixed("C"), "-"))
+    ),
+  keep.extra.columns = TRUE
+)
+```
+
+
+```{r}
+repeatmasker_beds <- split(repeatmasker_gr, repeatmasker_gr$class_family) %>%
+  as.list()
+
+dir.create("repeat_beds", showWarnings = FALSE)
+iwalk(
+  repeatmasker_beds,
+  \(x, n) {
+    rtracklayer::export(
+      x,
+      file.path("repeat_beds", paste0(str_replace(n, fixed("/"), "_"), ".bed"))
+    )
+  }
+)
+```
+
+## Overlap of repeats with DE genes in dsRNA pulldown
+
+```{r}
+deseq_als_only_raw <- syn("syn63099322") %>%
+  read_csv() %>%
+  mutate(
+    # Reverse engineer the control mean from baseMean and lfc
+    control_mean = 2 * baseMean / (2**lfc + 1),
+    up = if_else(padj < 0.05 & lfc > 0, 1, 0) %>%
+      replace_na(0)
+  )
+# Some genes don't have chromosme information, have to add it
+
+setdiff(deseq_als_only_raw$gene_id, ensembl_gtf$gene_id)
+
+ensembl_gene_info <- ensembl_gtf %>%
+  as_tibble() %>%
+  filter(type == "gene") %>%
+  transmute(
+    gene_id,
+    chr = seqnames,
+    start, end, strand,
+    biotype = gene_biotype,
+    gene_name
+  )
+
+deseq_als_only <- deseq_als_only_raw %>%
+  select(-c(chr, start, end, strand, biotype, gene_name, description, symbol)) %>%
+  distinct() %>%
+  power_left_join(
+    ensembl_gene_info,
+    by = "gene_id",
+    check = check_specs(
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn"
+    )
+  )
+
+table(deseq_als_only$up)
+```
+
+
+
+```{r}
+deseq_als_only_clean <- deseq_als_only %>%
+  drop_na(control_mean)
+
+library(MatchIt)
+set.seed(42)
+matches <- matchit(
+  up ~ control_mean + biotype + chr,
+  data = deseq_als_only_clean,
+  method = "nearest",
+  ratio = 10
+  # s.weights = c(control_mean = 1, biotype = 3, chr = .5)
+)
+
+matches_summary <- summary(matches)
+matches_summary
+
+x <- capture.output(
+  matches_summary$sum.matched %>%
+    as_tibble(rownames = "coef") %>%
+    select(`coef`, `Means Treated`, `Means Control`) %>%
+    mutate(across(-coef, \(x) signif(x, 2))) %>%
+    print(n = Inf)
+)
+
+matches_df <- match.data(matches) %>%
+ as_tibble()
+```
+
+
+```{r}
+matches_df_up <- matches_df %>%
+  filter(up == 1)
+
+matches_df_other <- matches_df %>%
+  filter(up == 0)
+
+n_gene_set <- nrow(filter(deseq_als_only_clean, up == 1))
+withr::with_seed(
+  42, {
+    perm_indices <- map(
+      1:1000,
+      \(x) sample(seq_len(nrow(matches_df_other)), size = n_gene_set, replace = FALSE)
+    )
+  }
+)
+
+ensembl_gtf_genes <- subset(ensembl_gtf, type == "gene")
+
+gene_lengths <- tibble(
+  gene_id = ensembl_gtf_genes$gene_id,
+  gene_length = width(ensembl_gtf_genes)
+)
+
+compute_overlap <- function(genes, repeats) {
+  # overlapsAny(genes, repeats, ignore.strand = TRUE, minoverlap = 10)
+  x <- mergeByOverlaps(repeats, genes, ignore.strand = TRUE, type = "within")
+  # browser()
+  as_tibble(x$genes) %>%
+    dplyr::count(perm_id, gene_id_perm, gene_id)
+  # table(x$genes)
+}
+
+repeat_family_df <- tibble(
+  family = unique(repeatmasker_gr$class_family)
+) %>%
+  mutate(
+    family_id = seq_len(n()),
+    repeat_gr = map(family, \(x) subset(repeatmasker_gr, class_family == x))
+  )
+
+gene_perm_df <- tibble(
+  perm_id = 1:1000
+) %>%
+  mutate(
+    gene_gr = imap(
+      perm_indices,
+      \(x, i) {
+        gr <- ensembl_gtf_genes[match(matches_df_other[x, ]$gene_id, ensembl_gtf_genes$gene_id),]
+        gr$gene_id_perm <- seq_len(length(gr))
+        gr$perm_id <- i
+        gr
+      }
+    )
+  )
+
+genes_unperm_gr <- subset(ensembl_gtf_genes, gene_id %in% matches_df_up$gene_id)
+genes_unperm_gr$gene_id_perm <- seq_len(length(genes_unperm_gr))
+genes_unperm_gr$perm_id <- -1
+
+gene_perm_gr <- do.call(c, c(gene_perm_df$gene_gr, genes_unperm_gr))
+```
+
+### Different approach where I precompute overlap for all control and actual genes
+
+```{r}
+matches_gr <- makeGRangesFromDataFrame(
+  matches_df,
+  keep.extra.columns = TRUE
+)
+
+all_overlap <- repeat_family_df %>%
+  mutate(
+    overlaps = map(
+      repeat_gr,
+      \(x) mergeByOverlaps(x, matches_gr, ignore.strand = TRUE, type = "within")
+    )
+  )
+
+all_overlap_df <- all_overlap %>%
+  select(-repeat_gr) %>%
+  mutate(
+    overlaps = map(
+      overlaps,
+      \(x) as_tibble(x$matches_gr) %>%
+        dplyr::count(up, gene_id)
+    )
+  ) %>%
+  unnest(overlaps) %>%
+  # Make zeros explicit
+  bind_rows(
+    anti_join(
+      cross_join(
+        select(matches_df, up, gene_id),
+        select(repeat_family_df, family_id, family)
+      ) %>%
+        mutate(n = 0),
+      .,
+      by = c("up", "gene_id", "family_id", "family")
+    )
+  ) %>%
+  power_left_join(
+    gene_lengths,
+    by = "gene_id",
+    check = check_specs(
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  mutate(
+    density = n / gene_length
+  )
+
+withr::with_seed(
+  42, {
+    perm_df <- tibble(
+      perm_id = 1:1000
+    ) %>%
+      mutate(
+        gene_perms = map(
+          1:1000,
+          \(x) sample(matches_df$gene_id, size = n_gene_set, replace = FALSE)
+        )
+      ) %>%
+      bind_rows(
+        tibble(
+          perm_id = -1,
+          gene_perms = list(matches_df_up$gene_id)
+        )
+      )
+  }
+)
+```
+
+
+```{r}
+library(furrr)
+plan(multicore(workers = 7))
+
+perm_res <- perm_df %>%
+  mutate(
+    res = future_map2(
+      gene_perms, perm_id,
+      \(x, i) {
+        message("Computing overlaps for perm_id ", i)
+        overlaps <- all_overlap_df %>%
+          mutate(up = if_else(gene_id %in% x, 1, 0))
+        overlaps %>%
+          group_by(
+            family_id, family
+          ) %>%
+          summarize(
+            # mann_u_res = wilcox.test(
+            #   density ~ up,
+            #   data = cur_data()
+            # ) %>%
+            #   list(),
+            # kendall_res = cor.test(
+            #   density, up,
+            #   method = "kendall"
+            # ) %>%
+            #   list(),
+            mann_u_exact_res = safely(exactRankTests::wilcox.exact)(
+              density ~ up,
+              data = cur_data(),
+              conf.int = TRUE
+            ) %>%
+              list(),
+            .groups = "drop"
+          )
+      },
+      .progress = TRUE
+    )
+  )
+
+qsave(
+  perm_res,
+  file.path("dsrna", "perm_res.qs")
+)
+```
+
+```{r}
+perm_res_long <- perm_res %>%
+  select(-gene_perms) %>%
+  unnest(res) %>%
+  mutate(across(c(mann_u_res, kendall_res), \(x) future_map(x, broom::tidy))) %>%
+  pivot_longer(
+    c(mann_u_res, kendall_res),
+    names_to = "statistic_type",
+    values_to = "res"
+  ) %>%
+  unnest(res)
+
+write_csv(
+  perm_res_long,
+  file.path("dsrna", "perm_res_long.csv.gz")
+)
+```
+
+```{r}
+synStoreMany(
+  file.path("dsrna", c("perm_res.qs", "perm_res_long.csv.gz")),
+  parentId = "syn63099319",
+  forceVersion = FALSE
+)
+
+# perm_res_long <- syn("syn63139482") %>%
+#   read_csv(col_types = cols(estimate = col_double()))
+```
+
+
+```{r}
+perm_res_p <- perm_res_long %>%
+  group_by(family, statistic_type) %>%
+  summarize(
+    p = sum(statistic[perm_id != -1] >= statistic[perm_id == -1]) / (n() - 1),
+    .groups = "drop"
+  )
+
+```
+
+
+```{r}
+p <- ggplot(
+  perm_res_p,
+  aes(x = p)
+) +
+  geom_histogram() +
+  facet_wrap(~statistic_type, scales = "free")
+
+
+```
+
+```{r}
+overlaps <- repeat_family_df %>%
+  mutate(
+    overlaps = map2(
+      repeat_gr, family,
+      \(gr, fam) {
+        message("Computing overlaps for ", fam)
+        compute_overlap(gene_perm_gr, gr) %>%
+          power_left_join(
+            gene_lengths,
+            by = "gene_id",
+            check = check_specs(
+              duplicate_keys_right = "warn",
+              unmatched_keys_left = "warn"
+            )
+          ) %>%
+          mutate(
+            density = n / gene_length
+          )
+      }
+    )
+  )
+
+overlaps_summary <- overlaps %>%
+  select(-repeat_gr) %>%
+  mutate(
+    overlaps = map(
+      overlaps,
+      \(x) group_by(x, perm_id) %>%
+        summarize(
+          density_mean = sum(density) / n_gene_set,
+          density_median = median(c(density, rep_len(0, n_gene_set - n()))),
+          density_wins = mean(statar::winsorize(c(density, rep_len(0, n_gene_set - n())), probs = c(0.1, 0.9), verbose = FALSE)),
+          density_q3 = mean(quantile(c(density, rep_len(0, n_gene_set - n())), probs = .75, names = FALSE)),
+          .groups = "drop"
+        )
+    )
+  ) %>%
+  unnest(overlaps)
+
+overlaps_p <- overlaps_summary %>%
+  group_by(family) %>%
+  summarize(
+    p_mean = sum(density_mean[perm_id != -1] >= density_mean[perm_id == -1]) / (n() - 1),
+    p_median = sum(density_median[perm_id != -1] >= density_median[perm_id == -1]) / (n() - 1),
+    p_wins = sum(density_wins[perm_id != -1] >= density_wins[perm_id == -1]) / (n() - 1),
+    p_q3 = sum(density_q3[perm_id != -1] >= density_q3[perm_id == -1]) / (n() - 1),
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+p <- overlaps_summary %>%
+  mutate(across(starts_with("density"), \(x) x * 1e6)) %>%
+  ggplot(
+    aes(density_q3)
+  ) +
+  geom_histogram(
+    data = \(x) filter(x, perm_id != -1)
+  ) +
+  geom_vline(
+    aes(xintercept = density_q3),
+    data = \(x) filter(x, perm_id == -1),
+    color = "red"
+  ) +
+  geom_text(
+    aes(label = signif(p_q3, 2), color = p_q3 < 0.05),
+    x = Inf, y = Inf,
+    hjust = 1, vjust = 1,
+    data = overlaps_p
+  ) +
+  scale_color_manual(
+    values = c(`TRUE` = "red", `FALSE` = "black"),
+    guide = "none"
+  ) +
+  scale_x_continuous(n.breaks = 4) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  ggh4x::facet_wrap2(
+    ~family,
+    scales = "free",
+    axes = "x"
+  ) +
+  theme_minimal() +
+  coord_cartesian(clip = FALSE) +
+  labs(x = "Repeats per million bp", y = "Count")
+
+dir.create("dsrna_overlap_plots", showWarnings = FALSE)
+ggsave(
+  file.path("dsrna_overlap_plots", "als_only_density_q3_histograms.pdf"),
+  p, width = 10, height = 8
+)
+```
+
+
+```{r}
+p <- overlaps_summary %>%
+  mutate(across(starts_with("density"), \(x) x * 1e6)) %>%
+  ggplot(
+    aes(density_wins)
+  ) +
+  geom_histogram(
+    data = \(x) filter(x, perm_id != -1)
+  ) +
+  geom_vline(
+    aes(xintercept = density_wins),
+    data = \(x) filter(x, perm_id == -1),
+    color = "red"
+  ) +
+  geom_text(
+    aes(label = signif(p_wins, 2), color = p_wins < 0.05),
+    x = Inf, y = Inf,
+    hjust = 1, vjust = 1,
+    data = overlaps_p
+  ) +
+  scale_color_manual(
+    values = c(`TRUE` = "red", `FALSE` = "black"),
+    guide = "none"
+  ) +
+  scale_x_continuous(n.breaks = 4) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  ggh4x::facet_wrap2(
+    ~family,
+    scales = "free",
+    axes = "x"
+  ) +
+  theme_minimal() +
+  coord_cartesian(clip = FALSE) +
+  labs(x = "Repeats per million bp", y = "Count")
+
+dir.create("dsrna_overlap_plots", showWarnings = FALSE)
+ggsave(
+  file.path("dsrna_overlap_plots", "als_only_density_wins_histograms.pdf"),
+  p, width = 10, height = 8
+)
+```
+
+
+```{r}
+p <- overlaps_summary %>%
+  mutate(across(starts_with("density"), \(x) x * 1e6)) %>%
+  ggplot(
+    aes(density_median)
+  ) +
+  geom_histogram(
+    data = \(x) filter(x, perm_id != -1)
+  ) +
+  geom_vline(
+    aes(xintercept = density_median),
+    data = \(x) filter(x, perm_id == -1),
+    color = "red"
+  ) +
+  geom_text(
+    aes(label = signif(p_median, 2), color = p_median < 0.05),
+    x = Inf, y = Inf,
+    hjust = 1, vjust = 1,
+    data = overlaps_p
+  ) +
+  scale_color_manual(
+    values = c(`TRUE` = "red", `FALSE` = "black"),
+    guide = "none"
+  ) +
+  scale_x_continuous(n.breaks = 4) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  ggh4x::facet_wrap2(
+    ~family,
+    scales = "free",
+    axes = "x"
+  ) +
+  theme_minimal() +
+  coord_cartesian(clip = FALSE) +
+  labs(x = "Repeats per million bp", y = "Count")
+
+dir.create("dsrna_overlap_plots", showWarnings = FALSE)
+ggsave(
+  file.path("dsrna_overlap_plots", "als_only_density_median_histograms.pdf"),
+  p, width = 10, height = 8
+)
+```
+
+```{r}
+p <- overlaps_summary %>%
+  mutate(across(starts_with("density"), \(x) x * 1e6)) %>%
+  ggplot(
+    aes(density_mean)
+  ) +
+  geom_histogram(
+    data = \(x) filter(x, perm_id != -1)
+  ) +
+  geom_vline(
+    aes(xintercept = density_mean),
+    data = \(x) filter(x, perm_id == -1),
+    color = "red"
+  ) +
+  geom_text(
+    aes(label = signif(p_mean, 2), color = p_mean < 0.05),
+    x = Inf, y = Inf,
+    hjust = 1, vjust = 1,
+    data = overlaps_p
+  ) +
+  scale_color_manual(
+    values = c(`TRUE` = "red", `FALSE` = "black"),
+    guide = "none"
+  ) +
+  scale_x_continuous(n.breaks = 4) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  ggh4x::facet_wrap2(
+    ~family,
+    scales = "free",
+    axes = "x"
+  ) +
+  theme_minimal() +
+  coord_cartesian(clip = FALSE) +
+  labs(x = "Repeats per million bp", y = "Count")
+
+dir.create("dsrna_overlap_plots", showWarnings = FALSE)
+ggsave(
+  file.path("dsrna_overlap_plots", "als_only_density_mean_histograms.pdf"),
+  p, width = 10, height = 8
+)
+```
+
+```{r}
+overlaps_summary_long <- overlaps_summary %>%
+  pivot_longer(
+    starts_with("density"),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    across(metric, \(x) str_remove(x, fixed("density_")))
+  )
+
+overlaps_p_long <- overlaps_p %>%
+  pivot_longer(
+    starts_with("p_"),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    across(metric, \(x) str_remove(x, fixed("p_")))
+  )
+```
+
+```{r}
+library(ggridges)
+
+p <- overlaps_summary_long %>%
+  mutate(across(value, \(x) x * 1e6)) %>%
+  group_by(family, metric) %>%
+  mutate(
+    value_scaled = scale(value, center = TRUE, scale = TRUE)[, 1]
+  ) %>%
+  ungroup() %>%
+  ggplot(
+    aes(
+      x = value_scaled,
+      y = family
+    )
+  ) +
+  geom_density_ridges(
+    aes(height = after_stat(ndensity)),
+    data = \(x) filter(x, perm_id != -1),
+    scale = 1.25,
+    stat = "density"
+  ) +
+  geom_segment(
+    aes(xend = value_scaled, yend = after_stat(y) + 0.9),
+    data = \(x) filter(x, perm_id == -1),
+    color = "firebrick1"
+  ) +
+  facet_wrap(~metric, scales = "free_x", nrow = 1) +
+  theme_ridges()
+```
+
+
+```{r}
+overlaps_sine_alu_ave <- overlaps_sine_alu %>%
+  mutate(
+    overlaps = map(
+      overlaps,
+      \(x) group_by(x, perm_id) %>%
+        summarize(
+          density_mean = sum(density) / n_gene_set,
+          density_median = median(c(density, rep_len(0, n_gene_set - n()))),
+          .groups = "drop"
+        )
+    )
+  )
+
+
+density_real <- compute_overlap_gene_only(subset(ensembl_gtf_genes, gene_id %in% filter(deseq_als_only_clean, up == 1)$gene_id), repeat_family_df$repeat_gr[[9]]) %>%
+    power_left_join(
+    gene_lengths,
+    by = "gene_id",
+    check = check_specs(
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  mutate(
+    density = n / gene_length
+  ) %>%
+  summarize(
+    density_mean = sum(density) / n_gene_set,
+    density_median = median(c(density, rep_len(0, n_gene_set - n()))),
+    .groups = "drop"
+  )
+
+sum(overlaps_sine_alu_ave$overlaps[[1]]$density_mean > density_real$density_mean) / 1000
+sum(overlaps_sine_alu_ave$overlaps[[1]]$density_median > density_real$density_median) / 1000
+```
+
+```{r}
+overlaps_sine_alu <- repeat_family_df %>%
+  mutate(
+    overlaps = map2(
+      repeat_gr, family,
+      \(gr, fam) {
+        message("Computing overlaps for ", fam)
+        map(
+          set_names(gene_perm_df$perm_id),
+          \(y) {
+            compute_overlap(gene_perm_df$gene_gr[[y]], gr)
+          }
+        ) %>%
+          bind_rows(.id = "perm_id") %>%
+          power_left_join(
+            gene_lengths,
+            by = "gene_id",
+            check = check_specs(
+              duplicate_keys_right = "warn",
+              unmatched_keys_left = "warn"
+            )
+          ) %>%
+          mutate(
+            density = n / gene_length
+          )
+      }
+    )
+  )
+
+
+```
+
+```{r}
+overlaps_sine_alu <- map(
+  repeat_family_df$family_id,
+  \(x) {
+    message("Computing overlaps for ", x)
+    map_int(
+      gene_perm_df$perm_id,
+      \(y) {
+        sum(compute_overlap(gene_perm_df$gene_gr[[y]], repeat_family_df$repeat_gr[[x]]))
+      }
+    )
+  }
+)
+```
+
+
+```{r}
+ensembl_gtf$type %>% table()
+ensembl_gtf$gene_biotype %>% table()
+```
+
+
+```{r}
+ensembl_gtf_ <- ensembl_gtf
+mcols(ensembl_gtf_) <- NULL
+ensembl_gtf_$family <- ensembl_gtf$type
+ensembl_gtf_$name <- ensembl_gtf$gene_biotype
+
+repeatmasker_gr_ <- repeatmasker_gr
+mcols(repeatmasker_gr_) <- NULL
+repeatmasker_gr_$family <- repeatmasker_gr$class_family
+repeatmasker_gr_$name <- repeatmasker_gr$rep_name
+
+combined_annotation <- c(
+  ensembl_gtf_, repeatmasker_gr_
+)
+```
+
+
+```{r}
+dsrid_calls <- syn("syn55256639") %>%
+  read_csv()
+
+dsrid_gr <- makeGRangesFromDataFrame(
+  dsrid_calls, keep.extra.columns = TRUE
+)
+```
+
+```{r}
+dsrid_calls %>%
+  ggplot(aes(pred_1)) +
+  geom_histogram()
+```
+
+```{r}
+overlaps <- findOverlaps(
+  dsrid_gr, combined_annotation
+)
+
+a <- queryHits(overlaps)
+
+overlaps_df <- as_tibble(overlaps) %>%
+  mutate(
+    family = combined_annotation$family[subjectHits],
+    name = combined_annotation$name[subjectHits],
+    ds_probability = dsrid_gr$pred_1[queryHits],
+    class = if_else(
+      family %in% c("gene", "transcript", "exon", "CDS", "five_prime_utr", "three_prime_utr"),
+      name, family
+    )
+  )
+
+
+```
+
+```{r}
+overlaps_df %>%
+  filter(ds_probability > .6) %>%
+  distinct(queryHits, class) %>%
+  group_by(class) %>%
+  summarize(
+    prop = n() / nrow(filter(dsrid_calls, pred_1 > 0.6))
+  ) %>%
+  arrange(prop) %>%
+  mutate(
+    class = fct_inorder(class)
+  ) %>%
+  ggplot(
+    aes(class, prop)
+  ) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent)
+```
+
