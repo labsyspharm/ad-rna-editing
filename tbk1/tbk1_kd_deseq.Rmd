@@ -1,0 +1,177 @@
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(here)
+library(powerjoin)
+library(qs)
+```
+
+```{r}
+meta_raw <- read_csv(here("tbk1", "200224_Plate_map_SteveR_Albers.csv"))
+
+counts_raw <- read_csv(here("tbk1", "aligned_counts_ReN VM RNAseq by Laura_original.csv")) %>%
+  # Remove rows that have metadata repeated, for some reason
+  drop_na(id)
+```
+
+DESeq2 expects a matrix as input. Make a matrix out of the raw counts.
+
+```{r}
+gene_count_mat <- counts_raw %>%
+  select(-symbol) %>%
+  column_to_rownames("id") %>%
+  as.matrix()
+```
+
+Make map from gene ids to symbols.
+
+```{r}
+gene_id_gene_symbol_map <- counts_raw %>%
+  select(ensembl_gene_id = id, hgnc_symbol = symbol)
+```
+
+
+Select genes for differential expression analysis, only take those with more
+than 5 counts in at least 3 samples.
+
+```{r}
+genes_passing_filter <- rownames(gene_count_mat)[rowSums(gene_count_mat > 5) > 3]
+```
+
+Only use samples relating to TBK1/TYK2 for now (first 30 samples).
+
+```{r}
+meta <- meta_raw[1:30,] %>%
+  mutate(
+    condition = `Sample name`
+  )
+```
+
+
+
+```{r}
+library(DESeq2)
+
+dds <- DESeqDataSetFromMatrix(
+  gene_count_mat[genes_passing_filter, meta$`Sample ID`],
+  meta,
+  design = ~condition
+) %>%
+  DESeq()
+```
+
+```{r}
+counts_trans <- list(
+  vsn = assay(varianceStabilizingTransformation(dds, blind = FALSE)),
+  rlog = assay(rlog(dds, blind = FALSE)),
+  normalized = counts(dds, normalized = TRUE),
+  raw = counts(dds, normalized = FALSE)
+) %>%
+  map(
+    \(x) as_tibble(x, rownames = "gene_id")
+  ) %>%
+  bind_rows(.id = "transformation") %>%
+  power_left_join(
+    gene_id_gene_symbol_map,
+    by = c("gene_id" = "ensembl_gene_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  select(transformation, gene_id, hgnc_symbol, everything())
+
+write_csv(
+  counts_trans,
+  here("tbk1", "200224_normalized_counts_all.csv")
+)
+
+counts_trans %>%
+  group_nest(transformation) %>%
+  pwalk(
+    \(transformation, data) {
+      write_csv(
+        data,
+        here("tbk1", paste0("200224_normalized_counts_", transformation, ".csv"))
+      )
+    }
+  )
+```
+
+
+```{r}
+extract_deseq_result <- function(de, contrast, name) {
+  if (missing(contrast)) {
+    res <- results(de, name = name)
+  } else {
+    res <- results(de, contrast = contrast)
+  }
+  shrunken <- lfcShrink(de, res = res, type = "ashr")
+  shrunken %>%
+    as_tibble(rownames = "gene_id") %>%
+    left_join(
+      res %>%
+        as_tibble(rownames = "gene_id") %>%
+        select(gene_id, log2FoldChange, lfcSE),
+      by = "gene_id", suffix = c("", "_MLE")
+    )
+}
+```
+
+As an example, compare "TYK2 KO + pic" vs "TYK2 KO (lipo)""
+
+
+```{r}
+res <- extract_deseq_result(
+  dds,
+  contrast = c("condition", "TYK2 KO + pic", "TYK2 KO (lipo)")
+) %>%
+  power_left_join(
+    gene_id_gene_symbol_map,
+    by = c("gene_id" = "ensembl_gene_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+write_csv(
+  res,
+  here("tbk1", "200224_tyk2_ko_pic_vs_lipo.csv")
+)
+```
+
+
+```{r}
+p <- res %>%
+  mutate(
+    direction = case_when(
+      is.na(padj) ~ "ns",
+      padj > 0.05 ~ "ns",
+      log2FoldChange_MLE > 0 ~ "up",
+      log2FoldChange_MLE < 0 ~ "down",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  ggplot(
+    aes(x = log2FoldChange_MLE, y = -log10(pvalue), color = padj < 0.05)
+  ) +
+  ggrastr::rasterize(geom_point(alpha = 0.5, shape = 16), dpi = 300) +
+  geom_text(
+    aes(x = x, hjust = hjust, label = n),
+    y = Inf, vjust = 1,
+    data = \(x) dplyr::count(x, direction) %>%
+      filter(direction != "ns") %>%
+      mutate(
+        x = if_else(direction == "up", Inf, -Inf),
+        hjust = if_else(direction == "up", 1, 0)
+      ),
+    inherit.aes = FALSE
+  )
+
+ggsave(
+  here("tbk1", "200224_tyk2_ko_pic_vs_lipo_volcano.pdf"),
+  p, width = 6, height = 4
+)
+```
