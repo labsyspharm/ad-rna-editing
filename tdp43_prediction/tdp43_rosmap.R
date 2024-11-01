@@ -106,12 +106,13 @@ marker_counts_rosmap <- rosmap_quant %>%
     transcripts_of_interest,
     by = c("Name" = "transcript_id")
   ) %>%
-  inner_join(
-    distinct(rna_meta, file_prefix, library_prep_batch, specimenID),
+  power_inner_join(
+    distinct(rna_meta, file_prefix, library_prep_batch, specimenID) %>%
+      drop_na(file_prefix),
     by = c("file" = "file_prefix"),
-    checks = check_specs(
+    check = check_specs(
       unmatched_keys_left = "abort",
-      duplciate_keys_right = "abort"
+      duplicate_keys_right = "abort"
     )
   ) %>%
   inner_join(
@@ -138,9 +139,14 @@ set.seed(42)
 threshold_fits <- marker_counts_rosmap %>%
   filter(variant_association == "TDP-43-") %>%
   filter(TPM > 0) %>%
-  mutate(logTPM = log10(TPM)) %>%
+  mutate(
+    logTPM = log10(TPM)
+  ) %>%
   group_nest(Name, brain_region) %>%
   inner_join(prior_thresholds, by = c("Name" = "transcript_name", "brain_region")) %>%
+  mutate(
+    Name = factor(Name, levels = unique(sort(Name)))
+  ) %>%
   mutate(
     gaussian_fit = map2(
       data, threshold,
@@ -165,7 +171,23 @@ threshold_fits <- marker_counts_rosmap %>%
     )
   )
 
-
+threshold_fits_gaussians <- threshold_fits %>%
+  select(Name, brain_region, gaussian_df) %>%
+  unnest(gaussian_df) %>%
+  mutate(
+    df = pmap(
+      .,
+      function(lambda, mu, sigma, ...) {
+        tibble(
+          logTPM = seq(from = -1.5, to = 3, length.out = 30)
+        ) %>%
+          mutate(
+            density_estimate = dnorm(logTPM, mean = mu, sd = sigma) * lambda,
+            TPM = 10**logTPM
+          )
+      }
+    )
+  )
 
 library(ggbeeswarm)
 p <- marker_counts_rosmap %>%
@@ -181,6 +203,12 @@ p <- marker_counts_rosmap %>%
         outlier_bottom = TPM == 0,
         TPM = if_else(TPM > 0, TPM, 0.5 * min(TPM[TPM > 0]))
       )
+  ) +
+  geom_path(
+    aes(as.integer(Name) + density_estimate, TPM, color = as.factor(gaussian), group = Name),
+    data = threshold_fits_gaussians %>%
+      unnest(df),
+    inherit.aes = FALSE
   ) +
   scale_shape_manual(values = c(`TRUE` = 25, `FALSE` = 16), guide = "none") +
   facet_wrap(~brain_region, scale = "free_x") +
@@ -218,13 +246,14 @@ rosmap_classification_expression <- marker_counts_rosmap %>%
   mutate(
     expressed = TPM > threshold
   ) %>%
-  select(file, specimenID, transcript_name, brain_region, expressed)
+  select(file, specimenID, transcript_name, brain_region, expressed, TPM, threshold)
 
 rosmap_classification <- rosmap_classification_expression %>%
   group_by(file, specimenID, brain_region) %>%
   summarize(n_expressed = sum(expressed), .groups = "drop") %>%
   inner_join(
     rosmap_classification_expression %>%
+      select(-TPM, -threshold) %>%
       pivot_wider(names_from = transcript_name, values_from = expressed),
     by = c("file", "specimenID", "brain_region")
   ) %>%
@@ -277,6 +306,28 @@ ggsave(
   "plots/rosmap_classification_n_samples.pdf", width = 4, height = 3
 )
 
+p <- rosmap_classification %>%
+  mutate(
+    n_expressed_class = factor(
+      n_expressed, levels = c(0, 1, 2, 3), labels = c("none", "1", "2", "3"),
+      ordered = TRUE
+    )
+  ) %>%
+  filter(brain_region == "PCC") %>%
+  group_by(brain_region, n_expressed_class) %>%
+  summarize(n = n(), .groups = "drop") %>%
+  ggplot(aes(n_expressed_class, y = n, fill = n_expressed_class)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = n), position = position_stack(vjust = 0.5)) +
+  guides(fill = "none") +
+  # shadowtext::geom_shadowtext(aes(label = n), position = position_stack(vjust = 0.5), size = 2) +
+  labs(x = "Number of cryptic transcripts\nexpressed above threshold", y = "Number of samples", fill = NULL)
+
+ggsave(
+  "plots/rosmap_classification_n_samples_pcc_only.pdf", width = 3, height = 2
+)
+
+
 p <- marker_counts_rosmap %>%
   # mutate(
   #   TPM_adj = TPM + .5 * min(salmon_quants_long$TPM[salmon_quants_long$TPM > 0])
@@ -324,6 +375,71 @@ ggsave(
   "plots/rosmap_toi_counts_colored.pdf", p,
   width = 8, height = 4
 )
+
+
+
+p <- marker_counts_rosmap %>%
+  # mutate(
+  #   TPM_adj = TPM + .5 * min(salmon_quants_long$TPM[salmon_quants_long$TPM > 0])
+  # ) %>%
+  filter(brain_region == "PCC") %>%
+  mutate(across(transcript_name, fct_rev)) %>%
+  ggplot(aes(transcript_name, TPM)) +
+  geom_quasirandom(
+    # aes(shape = outlier_bottom, color = outlier_bottom),
+    aes(shape = outlier_bottom),
+    data = ~.x %>%
+      mutate(
+        outlier_bottom = TPM == 0,
+        TPM = if_else(TPM > 0, TPM, 0.5 * min(TPM[TPM > 0]))
+      )
+  ) +
+  scale_shape_manual(values = c(`TRUE` = 6, `FALSE` = 16), guide = "none") +
+  geom_rect(
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = pos),
+    alpha = 0.2,
+    data = function(count_df) {
+      toi_thresholds %>%
+        filter(brain_region == "PCC") %>%
+        mutate(
+          transcript_name = factor(transcript_name, levels = levels(count_df$transcript_name)),
+          xmin = as.integer(transcript_name) - 0.5,
+          xmax = as.integer(transcript_name) + 0.5
+        ) %>%
+        crossing(pos = c("positive", "negative")) %>%
+        mutate(
+          ymin = if_else(pos == "positive", threshold, min(count_df$TPM)),
+          ymax = if_else(pos == "positive", max(count_df$TPM), threshold)
+        )
+    },
+    inherit.aes = FALSE
+  ) +
+  # geom_segment(
+  #   aes(x = as.integer(transcript_name) - 0.3, xend = as.integer(transcript_name) + 0.3, y = threshold, yend = threshold),
+  #   # alpha = 0.2,
+  #   color = "red",
+  #   data = function(count_df) {
+  #     toi_thresholds %>%
+  #       mutate(
+  #         transcript_name = factor(
+  #           transcript_name, levels = levels(count_df$transcript_name)
+  #         )
+  #       ) %>%
+  #       filter(brain_region == "PCC")
+  #   },
+  #   inherit.aes = FALSE
+  # ) +
+  scale_fill_manual(values = c("positive" = "firebrick1", "negative" = "mediumblue")) +
+  # scale_fill_manual(values = c("positive" = "red", "negative" = "blue")) +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(x = "Transcript", fill = "TDP-43 pathology\nprediction thresholds")
+
+ggsave(
+  "plots/rosmap_toi_counts_pcc_only.pdf", p,
+  width = 7, height = 3
+)
+
 
  toi_all_vs_all <- combn(transcripts_of_interest$transcript_id, 2, simplify = FALSE) %>%
   map(
@@ -384,3 +500,87 @@ toi_all_vs_all %>%
   ) %>%
   unnest(test_res) %>%
   View()
+
+rosmap_classification_braak <- rosmap_classification  %>%
+  inner_join(
+    rosmap_file_to_clinical %>%
+      distinct(file_prefix, individualID),
+    by = c("file" = "file_prefix")
+  ) %>%
+  inner_join(
+    rosmap_clinical %>%
+      distinct(individualID, braaksc)
+  )
+
+library(ggrepel)
+
+p <- rosmap_classification_braak %>%
+  count(brain_region, class_high, braaksc) %>%
+  ggplot(aes(class_high, y = n, fill = fct_inseq(as.character(braaksc), ordered = TRUE))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text_repel(
+    aes(label = n),
+    position = position_dodge(width = 0.9),
+    vjust = 1,
+    direction = "y",
+    segment.color = NA
+  ) +
+  facet_wrap(~brain_region) +
+  labs(x = "TDP-43 pathology prediction", y = "N cases", fill = "Braak stage")
+
+ggsave(
+  "plots/tdp43_prediction_high_braak_stage_distribution.pdf", width = 8, height = 4
+)
+
+
+p <- rosmap_classification_braak %>%
+  filter(brain_region == "PCC") %>%
+  count(class_high, braaksc) %>%
+  ggplot(aes(class_high, y = n, fill = fct_inseq(as.character(braaksc), ordered = TRUE))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text_repel(
+    aes(label = n),
+    position = position_dodge(width = 0.9),
+    vjust = 1,
+    direction = "y",
+    segment.color = NA
+  ) +
+  # facet_wrap(~brain_region) +
+  labs(x = "TDP-43 pathology prediction", y = "N cases", fill = "Braak stage")
+
+ggsave(
+  "plots/tdp43_prediction_high_pcc_braak_stage_distribution.pdf", width = 6, height = 3
+)
+
+
+library(brms)
+
+braak_model <- brm(
+  braaksc ~ class_high,
+  data = rosmap_classification_braak %>%
+    filter(brain_region == "PCC") %>%
+    mutate(
+      across(
+        braaksc,
+        ~fct_inseq(as.character(.x), ordered = TRUE)
+      )
+    ),
+  family = cumulative("logit"),
+  cores = 4,
+  chains = 4
+)
+
+summary(braak_model)
+bayestestR::sexit(braak_model)
+
+braak_model2 <- ordinal::clmm2(
+  braaksc ~ class_high,
+  data = rosmap_classification_braak %>%
+    filter(brain_region == "PCC") %>%
+    mutate(
+      across(
+        braaksc,
+        ~fct_inseq(as.character(.x), ordered = TRUE)
+      )
+    )
+)

@@ -7,6 +7,9 @@
 #SBATCH -o logs/%x_%j.out                 # File to which STDOUT will be written, including job ID (%j)
 #SBATCH -e logs/%x_%j.err                 # File to which STDERR will be written, including job ID (%j)
 
+# comm -1 -3 <(ls -1 trimmed | grep _1.fastq.gz$ | sed s/_1.fastq.gz//g | sort | uniq) <(ls -1 fastq | grep _1.fastq.gz | sed s/_1.fastq.gz//g | sort | uniq) |
+#  parallel sbatch trim_bbmap.sh {}
+
 module load java
 
 # USAGE
@@ -19,13 +22,13 @@ BBMAP_PATH=/home/ch305/software/bbmap
 PREFIX_PATH="$1"
 PREFIX_FILE="${PREFIX_PATH##*/}"
 
-touch "trimmed/${PREFIX_FILE}.lock"
+echo "$SLURM_JOB_ID" > "trimmed/${PREFIX_FILE}.lock"
 
-bbduk.sh -Xmx1g in1="${PREFIX_PATH}_1.fastq.gz" in2="${PREFIX_PATH}_2.fastq.gz" \
+${BBMAP_PATH}/bbduk.sh -Xmx1g in1="${PREFIX_PATH}_1.fastq.gz" in2="${PREFIX_PATH}_2.fastq.gz" \
   out1="trimmed/${PREFIX_FILE}_1.fastq.gz" out2="trimmed/${PREFIX_FILE}_2.fastq.gz" \
   ref="${BBMAP_PATH}/resources/adapters.fa" \
-  ktrim=r k=28 mink=13 hdist=1 stats="trimmed/${PREFIX_FILE}_trim_stats.txt" tbo tpe \
+  ktrim=r k=23 mink=13 hdist=1 stats="trimmed/${PREFIX_FILE}_trim_stats.txt" tbo tpe \
   threads=4
 
 rm "trimmed/${PREFIX_FILE}.lock"
-touch "trimmed/${PREFIX_FILE}.done"
+echo "$SLURM_JOB_ID" > "trimmed/${PREFIX_FILE}.done"

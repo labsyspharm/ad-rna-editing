@@ -29,6 +29,13 @@ ensembl_gtf <- rtracklayer::import(
   "Homo_sapiens.GRCh38.111.chr.gtf.gz"
 )
 
+ensembl_gtf_genes <- subset(ensembl_gtf, type == "gene")
+
+gene_lengths <- tibble(
+  gene_id = ensembl_gtf_genes$gene_id,
+  gene_length = width(ensembl_gtf_genes)
+)
+
 repeatmasker_raw <- syn("syn55256576") %>%
   read_csv()
 
@@ -40,6 +47,14 @@ repeatmasker_gr <- makeGRangesFromDataFrame(
     ),
   keep.extra.columns = TRUE
 )
+
+repeat_family_df <- tibble(
+  family = unique(repeatmasker_gr$class_family)
+) %>%
+  mutate(
+    family_id = seq_len(n()),
+    repeat_gr = map(family, \(x) subset(repeatmasker_gr, class_family == x))
+  )
 ```
 
 
@@ -58,6 +73,7 @@ iwalk(
   }
 )
 ```
+
 
 ## Overlap of repeats with DE genes in dsRNA pulldown
 
@@ -130,6 +146,69 @@ x <- capture.output(
 
 matches_df <- match.data(matches) %>%
  as_tibble()
+
+dir.create(here("dsrna"), showWarnings = FALSE)
+write_csv(
+  matches_df,
+  here("dsrna", "gene_propensity_matches_df.csv.gz")
+)
+```
+
+
+## Pre-compute overlap of REs with all genes
+
+```{r}
+matches_gr <- makeGRangesFromDataFrame(
+  matches_df,
+  keep.extra.columns = TRUE
+)
+
+all_overlap <-  mergeByOverlaps(
+  repeatmasker_gr,
+  ensembl_gtf_genes,
+  ignore.strand = TRUE,
+  type = "within"
+)
+
+all_overlap_df <- all_overlap %>%
+  as_tibble() %>%
+  mutate(
+    across(gene_id, \(x) factor(gene_id, levels = ensembl_gtf_genes$gene_id)),
+  ) %>%
+  dplyr::count(gene_id, class_family) %>%
+  # Make zeros explicit
+  complete(
+    gene_id, class_family,
+    fill = list(n = 0)
+  ) %>%
+  mutate(across(gene_id, as.character)) %>%
+  power_left_join(
+    gene_lengths,
+    by = "gene_id",
+    check = check_specs(
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  mutate(
+    density = n / gene_length
+  )
+
+dir.create(here("dsrna", "repeats"), showWarnings = FALSE)
+write_csv(
+  all_overlap_df,
+  here("dsrna", "repeats", "gene_repeat_overlap.csv.gz")
+)
+# all_overlap_df <- read_csv(here("dsrna", "repeats", "gene_repeat_overlap.csv.gz"))
+```
+
+
+```{r}
+synStoreMany(
+  here("dsrna", "repeats", "gene_repeat_overlap.csv.gz"),
+  parentId = "syn63099319",
+  forceVersion = FALSE
+)
 ```
 
 
@@ -149,103 +228,12 @@ withr::with_seed(
     )
   }
 )
-
-ensembl_gtf_genes <- subset(ensembl_gtf, type == "gene")
-
-gene_lengths <- tibble(
-  gene_id = ensembl_gtf_genes$gene_id,
-  gene_length = width(ensembl_gtf_genes)
-)
-
-compute_overlap <- function(genes, repeats) {
-  # overlapsAny(genes, repeats, ignore.strand = TRUE, minoverlap = 10)
-  x <- mergeByOverlaps(repeats, genes, ignore.strand = TRUE, type = "within")
-  # browser()
-  as_tibble(x$genes) %>%
-    dplyr::count(perm_id, gene_id_perm, gene_id)
-  # table(x$genes)
-}
-
-repeat_family_df <- tibble(
-  family = unique(repeatmasker_gr$class_family)
-) %>%
-  mutate(
-    family_id = seq_len(n()),
-    repeat_gr = map(family, \(x) subset(repeatmasker_gr, class_family == x))
-  )
-
-gene_perm_df <- tibble(
-  perm_id = 1:1000
-) %>%
-  mutate(
-    gene_gr = imap(
-      perm_indices,
-      \(x, i) {
-        gr <- ensembl_gtf_genes[match(matches_df_other[x, ]$gene_id, ensembl_gtf_genes$gene_id),]
-        gr$gene_id_perm <- seq_len(length(gr))
-        gr$perm_id <- i
-        gr
-      }
-    )
-  )
-
-genes_unperm_gr <- subset(ensembl_gtf_genes, gene_id %in% matches_df_up$gene_id)
-genes_unperm_gr$gene_id_perm <- seq_len(length(genes_unperm_gr))
-genes_unperm_gr$perm_id <- -1
-
-gene_perm_gr <- do.call(c, c(gene_perm_df$gene_gr, genes_unperm_gr))
 ```
+
 
 ### Different approach where I precompute overlap for all control and actual genes
 
 ```{r}
-matches_gr <- makeGRangesFromDataFrame(
-  matches_df,
-  keep.extra.columns = TRUE
-)
-
-all_overlap <- repeat_family_df %>%
-  mutate(
-    overlaps = map(
-      repeat_gr,
-      \(x) mergeByOverlaps(x, matches_gr, ignore.strand = TRUE, type = "within")
-    )
-  )
-
-all_overlap_df <- all_overlap %>%
-  select(-repeat_gr) %>%
-  mutate(
-    overlaps = map(
-      overlaps,
-      \(x) as_tibble(x$matches_gr) %>%
-        dplyr::count(up, gene_id)
-    )
-  ) %>%
-  unnest(overlaps) %>%
-  # Make zeros explicit
-  bind_rows(
-    anti_join(
-      cross_join(
-        select(matches_df, up, gene_id),
-        select(repeat_family_df, family_id, family)
-      ) %>%
-        mutate(n = 0),
-      .,
-      by = c("up", "gene_id", "family_id", "family")
-    )
-  ) %>%
-  power_left_join(
-    gene_lengths,
-    by = "gene_id",
-    check = check_specs(
-      duplicate_keys_right = "warn",
-      unmatched_keys_left = "warn"
-    )
-  ) %>%
-  mutate(
-    density = n / gene_length
-  )
-
 withr::with_seed(
   42, {
     perm_df <- tibble(
@@ -265,12 +253,15 @@ withr::with_seed(
       )
   }
 )
+
+overlap_matches <- all_overlap_df %>%
+  filter(gene_id %in% matches_df$gene_id)
 ```
 
 
 ```{r}
 library(furrr)
-plan(multicore(workers = 7))
+plan(multicore(workers = 4))
 
 perm_res <- perm_df %>%
   mutate(
@@ -278,23 +269,11 @@ perm_res <- perm_df %>%
       gene_perms, perm_id,
       \(x, i) {
         message("Computing overlaps for perm_id ", i)
-        overlaps <- all_overlap_df %>%
+        overlaps <- overlap_matches %>%
           mutate(up = if_else(gene_id %in% x, 1, 0))
         overlaps %>%
-          group_by(
-            family_id, family
-          ) %>%
+          group_by(class_family) %>%
           summarize(
-            # mann_u_res = wilcox.test(
-            #   density ~ up,
-            #   data = cur_data()
-            # ) %>%
-            #   list(),
-            # kendall_res = cor.test(
-            #   density, up,
-            #   method = "kendall"
-            # ) %>%
-            #   list(),
             mann_u_exact_res = safely(exactRankTests::wilcox.exact)(
               density ~ up,
               data = cur_data(),
@@ -310,7 +289,7 @@ perm_res <- perm_df %>%
 
 qsave(
   perm_res,
-  file.path("dsrna", "perm_res.qs")
+  file.path("dsrna", "perm_res2.qs")
 )
 ```
 
@@ -318,9 +297,9 @@ qsave(
 perm_res_long <- perm_res %>%
   select(-gene_perms) %>%
   unnest(res) %>%
-  mutate(across(c(mann_u_res, kendall_res), \(x) future_map(x, broom::tidy))) %>%
+  mutate(across(ends_with("res"), \(x) future_map(x, \(y) possibly(broom::tidy)(y$result)))) %>%
   pivot_longer(
-    c(mann_u_res, kendall_res),
+    ends_with("res"),
     names_to = "statistic_type",
     values_to = "res"
   ) %>%
@@ -346,12 +325,16 @@ synStoreMany(
 
 ```{r}
 perm_res_p <- perm_res_long %>%
-  group_by(family, statistic_type) %>%
+  group_by(class_family, statistic_type) %>%
   summarize(
     p = sum(statistic[perm_id != -1] >= statistic[perm_id == -1]) / (n() - 1),
     .groups = "drop"
   )
 
+write_csv(
+  perm_res_p,
+  file.path("dsrna", "perm_res_p.csv.gz")
+)
 ```
 
 
@@ -365,6 +348,53 @@ p <- ggplot(
 
 
 ```
+
+
+
+```{r}
+p <- perm_res_long %>%
+  # mutate(across(starts_with("density"), \(x) x * 1e6)) %>%
+  ggplot(
+    aes(statistic)
+  ) +
+  geom_histogram(
+    data = \(x) filter(x, perm_id != -1)
+  ) +
+  geom_vline(
+    aes(xintercept = statistic),
+    data = \(x) filter(x, perm_id == -1),
+    color = "red"
+  ) +
+  geom_text(
+    aes(label = signif(p, 2), color = p < 0.05),
+    x = Inf, y = Inf,
+    hjust = 1, vjust = 1,
+    data = perm_res_p
+  ) +
+  scale_color_manual(
+    values = c(`TRUE` = "red", `FALSE` = "black"),
+    guide = "none"
+  ) +
+  scale_x_continuous(n.breaks = 4) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  ggh4x::facet_wrap2(
+    ~class_family,
+    scales = "free",
+    axes = "x"
+  ) +
+  theme_minimal() +
+  coord_cartesian(clip = FALSE) +
+  labs(x = "Mann Whitney U statistic", y = "Count")
+
+dir.create("dsrna_overlap_plots", showWarnings = FALSE)
+ggsave(
+  file.path("dsrna_overlap_plots", "als_only_density_mann_whitney_u_histograms.pdf"),
+  p, width = 10, height = 8
+)
+```
+
 
 ```{r}
 overlaps <- repeat_family_df %>%
