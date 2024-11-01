@@ -1,0 +1,50 @@
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(powerjoin)
+library(qs)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+Get dsRIP counts that the Chan Bioinformatics core prepared.
+
+```{r}
+library(tximport)
+
+quant_files <- Sys.glob(here("dsrna", "data", "*", "quant.sf")) %>%
+  set_names(
+    map_chr(
+      .,
+      \(x) {
+        s <- fs::path_split(x)[[1]]
+        s[length(s) - 1]
+      }
+    )
+  )
+
+tx2gene <- read_tsv(here("dsrna", "data", "tx2gene.tsv"))
+
+gene_quants <- tximport(
+  quant_files,
+  type = "salmon",
+  tx2gene = tx2gene
+)
+
+qsave(
+  gene_quants,
+  file = here("dsrna", "data", "chan_salmon_gene_quants.qs")
+)
+
+synStoreMany(
+  here("dsrna", "data", "chan_salmon_gene_quants.qs"),
+  parentId = "syn63099319",
+  forceVersion = FALSE
+)
+```
+
+

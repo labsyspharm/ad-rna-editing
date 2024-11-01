@@ -1,0 +1,530 @@
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(powerjoin)
+library(qs)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+```{r}
+
+ensembl_gtf_file <- "Homo_sapiens.GRCh38.111.gtf.gz"
+if (!file.exists(ensembl_gtf_file)) {
+  download.file(
+    "ftp://ftp.ensembl.org/pub/release-111/gtf/homo_sapiens/Homo_sapiens.GRCh38.111.gtf.gz",
+    ensembl_gtf_file, method = "curl"
+  )
+}
+
+ensembl_gtf <- rtracklayer::readGFF(ensembl_gtf_file) %>%
+  # filter(gene_biotype == "protein_coding") %>%
+  distinct(
+    ensembl_gene_id = gene_id,
+    hgnc_symbol = gene_name,
+    gene_biotype
+  ) %>%
+  drop_na(ensembl_gene_id)
+
+gene_id_gene_symbol_map <- ensembl_gtf %>%
+  distinct(ensembl_gene_id, hgnc_symbol)
+
+
+```
+
+
+```{r}
+gene_quants <- syn("syn63665472") %>%
+  qread()
+
+gene_cout_mat <- gene_quants$counts
+
+genes_passing_filter <- rownames(gene_cout_mat)[rowSums(gene_cout_mat > 5) > 3]
+
+gene_quants_filtered <- gene_quants %>%
+  imap(
+    \(x, y) {
+      if (is(x, "matrix")) {
+        x[genes_passing_filter, ]
+      } else {
+        x
+      }
+    }
+  )
+
+meta <- tibble(
+  sample_id = colnames(gene_quants$abundance)
+) %>%
+  separate_wider_regex(
+    sample_id,
+    patterns = c(population = "[A-Za-z0-9]+", "_", assay = "[A-Za-z]+", "_", replicate = "\\d?", "_?", company = "\\w+"),
+    cols_remove = FALSE
+  ) %>%
+  mutate(
+    replicate = if_else(replicate == "", "1", replicate),
+    population = fct_relevel(population, "Ctrl"),
+    assay = fct_relevel(assay, "Total"),
+    across(c(company, replicate), as.factor)
+  )
+```
+
+
+
+```{r}
+library(DESeq2)
+
+dds <- DESeqDataSetFromTximport(
+  gene_quants_filtered,
+  meta,
+  design = ~ population + assay + population:assay + company
+) %>%
+  DESeq()
+
+
+```
+
+```{r}
+counts_trans <- list(
+  vsn = assay(varianceStabilizingTransformation(dds, blind = FALSE)),
+  rlog = assay(rlog(dds, blind = FALSE)),
+  normalized = counts(dds, normalized = TRUE),
+  raw = counts(dds, normalized = FALSE)
+) %>%
+  map(
+    \(x) as_tibble(x, rownames = "gene_id")
+  ) %>%
+  bind_rows(.id = "transformation") %>%
+  mutate(
+    across(gene_id, \(x) str_remove(x, "\\.\\d+$"))
+  ) %>%
+  power_left_join(
+    gene_id_gene_symbol_map,
+    by = c("gene_id" = "ensembl_gene_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  select(transformation, gene_id, hgnc_symbol, everything())
+
+write_csv(
+  counts_trans,
+  here("dsrna", "data", "dsrip_deseq_transformed_counts.csv.gz")
+)
+# counts_trans <- read_csv(here("dsrna", "data", "dsrip_deseq_transformed_counts.csv.gz"))
+```
+
+
+```{r}
+synStoreMany(
+  here("dsrna", "data", "dsrip_deseq_transformed_counts.csv.gz"),
+  parentId = "syn63099319",
+  forceVersion = FALSE
+)
+```
+
+
+```{r}
+extract_deseq_result <- function(de, contrast, name) {
+  if (missing(contrast)) {
+    res <- results(de, name = name)
+  } else {
+    res <- resu?relts(de, contrast = contrast)
+  }
+  shrunken <- lfcShrink(de, res = res, type = "ashr")
+  shrunken %>%
+    as_tibble(rownames = "gene_id") %>%
+    left_join(
+      res %>%
+        as_tibble(rownames = "gene_id") %>%
+        select(gene_id, log2FoldChange, lfcSE),
+      by = "gene_id", suffix = c("", "_MLE")
+    )
+}
+```
+
+
+```{r}
+res_raw <- map(
+  setdiff(resultsNames(dds), "Intercept") %>%
+    set_names(),
+  \(x) extract_deseq_result(dds, name = x)
+)
+```
+
+
+```{r}
+res <- bind_rows(res_raw, .id = "contrast") %>%
+  mutate(
+    across(gene_id, \(x) str_remove(x, "\\.\\d+$"))
+  ) %>%
+  power_left_join(
+    gene_id_gene_symbol_map,
+    by = c("gene_id" = "ensembl_gene_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+write_csv(
+  res,
+  here("dsrna", "data", "dsrip_deseq_results.csv.gz")
+)
+# res <- read_csv(here("dsrna", "data", "dsrip_deseq_results.csv.gz"))
+```
+
+Pairwise results
+
+```{r}
+res_pairwise <- tribble(
+  ~contrast, ~contrast_list,
+  "Ctrl_RIP_vs_Total", list(c("assay_RIP_vs_Total")),
+  "C9_RIP_vs_Total", list(c("populationC9.assayRIP", "assay_RIP_vs_Total")),
+) %>%
+  mutate(
+    res = map(
+      contrast_list,
+      \(x) extract_deseq_result(dds, contrast = x)
+    )
+  ) %>%
+  select(-contrast_list) %>%
+  unnest(res) %>%
+  mutate(
+    across(gene_id, \(x) str_remove(x, "\\.\\d+$"))
+  ) %>%
+  power_left_join(
+    gene_id_gene_symbol_map,
+    by = c("gene_id" = "ensembl_gene_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+
+write_csv(
+  res_pairwise,
+  here("dsrna", "data", "dsrip_deseq_pairwise_results.csv.gz")
+)
+```
+
+
+```{r}
+pairwise_comp <- res_pairwise %>%
+  select(contrast, gene_id, log2FoldChange, padj) %>%
+  pivot_wider(names_from = contrast, values_from = c(log2FoldChange, padj)) %>%
+  mutate(
+    significant = case_when(
+      padj_Ctrl_RIP_vs_Total < 0.05 & padj_C9_RIP_vs_Total < 0.05 ~ "both",
+      padj_Ctrl_RIP_vs_Total < 0.05 ~ "Ctrl_RIP_vs_Total",
+      padj_C9_RIP_vs_Total < 0.05 ~ "C9_RIP_vs_Total",
+      TRUE ~ "none"
+    ) %>%
+    factor(levels = c("none", "Ctrl_RIP_vs_Total", "C9_RIP_vs_Total", "both"))
+  ) %>%
+  power_inner_join(
+    res %>%
+      filter(contrast == "populationC9.assayRIP") %>%
+      transmute(
+        gene_id,
+        log2FoldChange, padj, log2FoldChange_MLE,
+        interaction_significant = padj < 0.05 %>%
+          replace_na(FALSE)
+      ),
+    by = "gene_id",
+    suffix = c("", "_interaction"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  arrange(interaction_significant, significant)
+
+p <- pairwise_comp %>%
+  ggplot(
+    aes(
+      x = log2FoldChange_Ctrl_RIP_vs_Total,
+      y = log2FoldChange_C9_RIP_vs_Total
+    )
+  ) +
+  geom_abline(color = "gray", intercept = 0, slope = 1) +
+  geom_point(
+    aes(
+      fill = significant,
+      color = interaction_significant
+    ),
+    shape = "circle filled"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "both" = "purple",
+      "Ctrl_RIP_vs_Total" = "blue",
+      "C9_RIP_vs_Total" = "red",
+      "none" = "black"
+    ) %>%
+      alpha(.5)
+  ) +
+  scale_color_manual(
+    values = c(
+      `TRUE` = alpha("green", 1),
+      `FALSE` = alpha("black", 0)
+    )
+  ) +
+  labs(
+    x = "Ctrl log2(fold change) RIP vs Total",
+    y = "C9 log2(fold change) RIP vs Total",
+    fill = "Significant",
+    color = "Interaction significant"
+  )
+
+
+ggsave(
+  file.path("dsrna", "plots", "dsrip_deseq_pairwise_rip_vs_total.pdf"),
+  p, width = 6, height = 5
+)
+
+ggsave(
+  file.path("dsrna", "plots", "dsrip_deseq_pairwise_rip_vs_total_zoomed.pdf"),
+  p + coord_cartesian(xlim = c(-5, 5), ylim = c(-5, 5)),
+  width = 6, height = 5
+)
+```
+
+
+
+```{r}
+synStoreMany(
+  here("dsrna", "data", c("dsrip_deseq_results.csv.gz", "dsrip_deseq_pairwise_results.csv.gz")),
+  parentId = "syn63099319",
+  forceVersion = FALSE
+)
+
+```
+
+```{r}
+p <- res %>%
+  mutate(
+    direction = case_when(
+      is.na(padj) ~ "ns",
+      padj > 0.05 ~ "ns",
+      log2FoldChange_MLE > 0 ~ "up",
+      log2FoldChange_MLE < 0 ~ "down",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  ggplot(
+    aes(x = log2FoldChange_MLE, y = -log10(pvalue), color = padj < 0.05)
+  ) +
+  ggrastr::rasterize(geom_point(alpha = 0.5, shape = 16), dpi = 300) +
+  geom_text(
+    aes(x = x, hjust = hjust, label = n),
+    y = Inf, vjust = 1,
+    data = \(x) dplyr::count(x, contrast, direction) %>%
+      filter(direction != "ns") %>%
+      mutate(
+        x = if_else(direction == "up", Inf, -Inf),
+        hjust = if_else(direction == "up", 1, 0)
+      ),
+    inherit.aes = FALSE
+  ) +
+  ggh4x::facet_wrap2(~contrast, scales = "free", axes = "all")
+
+ggsave(
+  here("dsrna", "plots", "dsrip_deseq_volcano.pdf"),
+  p, width = 6, height = 4
+)
+
+resultsNames(dds)
+
+res %>% filter(padj < 0.1, contrast == "assay_RIP_vs_Total") %>% View()
+res %>% filter(padj < 0.1, contrast == "population_C9_vs_Ctrl") %>% View()
+res %>% filter(padj < 0.1, contrast == "populationC9.assayRIP") %>% View()
+```
+
+
+Compare with old Chan core results
+
+
+```{r}
+als_rip_vs_total_chan <- syn("syn63099322") %>%
+  read_csv()
+
+chan_mine_comp <- res %>%
+  filter(contrast == "assay_RIP_vs_Total") %>%
+  power_left_join(
+    als_rip_vs_total_chan %>%
+      distinct(gene_id, baseMean, log2FoldChange_MLE = lfc, lfcSE_MLE = lfcSE, pvalue, padj),
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    ),
+    suffix = c("_mine", "_chan")
+  ) %>%
+  mutate(
+    signed_logp_mine = -sign(log2FoldChange_MLE_mine) * log10(pvalue_mine),
+    signed_logp_chan = -sign(log2FoldChange_MLE_chan) * log10(pvalue_chan)
+  )
+```
+
+
+```{r}
+p <- chan_mine_comp %>%
+  ggplot(
+    aes(x = signed_logp_chan, y = signed_logp_mine)
+  ) +
+  ggrastr::rasterize(geom_point(alpha = 0.5, shape = 16), dpi = 300)
+
+ggsave(
+  here("dsrna", "plots", "dsrip_rip_vs_total_chan_mine_comparison.pdf"),
+  p, width = 4, height = 4
+)
+
+cor.test(
+  ~ signed_logp_chan + signed_logp_mine, data = chan_mine_comp, method = "kendall"
+)
+
+cor.test(
+  ~ signed_logp_chan + signed_logp_mine, data = chan_mine_comp, method = "pearson"
+)
+```
+
+
+## Spot check differentially expressed genes
+
+```{r}
+exemplar_genes <- withr::with_seed(
+  42,
+  res %>%
+    filter(padj < 0.05, contrast %in% c("population_C9_vs_Ctrl", "assay_RIP_vs_Total", "populationC9.assayRIP")) %>%
+    group_by(contrast, log2FoldChange_MLE > 0) %>%
+    arrange(pvalue) %>%
+    slice_head(n = 30) %>%
+    slice_sample(n = 3) %>%
+    ungroup() %>%
+    mutate(
+      gene_name = coalesce(hgnc_symbol, gene_id)
+    )
+)
+
+counts_trans_long <- counts_trans %>%
+  pivot_longer(-c(transformation, gene_id, hgnc_symbol), names_to = "sample_id", values_to = "count")
+```
+
+```{r}
+library(ggbeeswarm)
+
+meta_fct <- meta %>%
+  mutate(
+    across(sample_id, fct_inorder),
+    condition = paste(population, assay, company, sep = "_") %>%
+      fct_inorder()
+  )
+
+ps <- counts_trans_long %>%
+  filter(transformation == "rlog") %>%
+  power_inner_join(
+    exemplar_genes %>%
+      select(gene_id, contrast, gene_name),
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(sample_id = factor(sample_id, levels = levels(meta_fct$sample_id))) %>%
+  power_left_join(
+    meta_fct,
+    by = "sample_id",
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn",
+    )
+  ) %>%
+  group_nest(contrast) %>%
+  mutate(
+    p = map2(
+      data, contrast,
+      \(data, contrast) {
+        ggplot(
+          data,
+          aes(x = condition, y = count, color = assay)
+        ) +
+          geom_quasirandom() +
+          facet_grid(vars(gene_name), vars(company), scales = "free") +
+          theme_bw() +
+          theme(
+            axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+          ) +
+          labs(title = contrast)
+      }
+    )
+  )
+
+pwalk(
+  ps,
+  \(contrast, p, ...) ggsave(
+    here("dsrna", "plots", paste0("dsrip_", contrast, "_rlog_counts.pdf")),
+    p, width = 4, height = 6
+  )
+)
+```
+
+Separate plot only for C9.RIP interaction
+
+```{r}
+p <- counts_trans_long %>%
+  filter(transformation == "rlog") %>%
+  power_inner_join(
+    exemplar_genes %>%
+      filter(contrast == "populationC9.assayRIP") %>%
+      select(gene_id, contrast, gene_name),
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(sample_id = factor(sample_id, levels = levels(meta_fct$sample_id))) %>%
+  power_left_join(
+    meta_fct,
+    by = "sample_id",
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn",
+    )
+  ) %>%
+  ggplot(
+    aes(x = assay, y = count, color = assay)
+  ) +
+    geom_quasirandom() +
+    geom_boxplot(outliers = FALSE, fill = NA) +
+    facet_grid(vars(gene_name), vars(population), scales = "free") +
+    theme_bw() +
+    ggokabeito::scale_color_okabe_ito(guide = "none") +
+    labs(
+      x = "Assay",
+      y = "Regularized log counts",
+
+    )
+    # theme(
+    #   axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+    # ) +
+
+
+ggsave(
+  here("dsrna", "plots", "dsrip_populationC9.assayRIP_rlog_boxplot.pdf"),
+  p, width = 3.5, height = 5
+)
+```
+

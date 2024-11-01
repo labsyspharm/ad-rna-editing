@@ -1,0 +1,469 @@
+```{r setup, include=FALSE}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(powerjoin)
+library(qs)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+```{r}
+dsrip_deseq_res <- syn("syn63686831") %>%
+  read_csv() %>%
+  mutate(
+    expression = case_when(
+      is.na(padj) ~ "ns",
+      padj > 0.1 ~ "ns",
+      log2FoldChange > 0 ~ "up",
+      log2FoldChange < 0 ~ "down",
+      TRUE ~ "ns"
+    )
+  )
+
+dsrip_deseq_pairwise_res <- syn("syn63927435") %>%
+  read_csv() %>%
+  mutate(
+    expression = case_when(
+      is.na(padj) ~ "ns",
+      padj > 0.1 ~ "ns",
+      log2FoldChange > 0 ~ "up",
+      log2FoldChange < 0 ~ "down",
+      TRUE ~ "ns"
+    )
+  )
+
+gene_re_overlap <- syn("syn63686788") %>%
+  read_csv() %>%
+  group_by(
+    class_family
+  ) %>%
+  mutate(
+    density_floor = .5 * min(density[density > 0]),
+    log_density = log10(if_else(density == 0, density_floor, density))
+  ) %>%
+  ungroup()
+```
+
+
+```{r}
+
+ensembl_gtf_file <- "Homo_sapiens.GRCh38.111.gtf.gz"
+if (!file.exists(ensembl_gtf_file)) {
+  download.file(
+    "ftp://ftp.ensembl.org/pub/release-111/gtf/homo_sapiens/Homo_sapiens.GRCh38.111.gtf.gz",
+    ensembl_gtf_file, method = "curl"
+  )
+}
+
+ensembl_gtf <- rtracklayer::readGFF(ensembl_gtf_file) %>%
+  # filter(gene_biotype == "protein_coding") %>%
+  distinct(
+    ensembl_gene_id = gene_id,
+    hgnc_symbol = gene_name,
+    gene_biotype
+  ) %>%
+  drop_na(ensembl_gene_id)
+
+gene_id_gene_symbol_map <- ensembl_gtf %>%
+  distinct(ensembl_gene_id, hgnc_symbol)
+```
+
+Are dsRIP pulled down genes enriched in certain REs?
+
+```{r}
+dsrip_re_cor_data <- bind_rows(
+  dsrip_deseq_pairwise_res,
+  dsrip_deseq_res %>%
+    filter(contrast == "populationC9.assayRIP")
+) %>%
+  power_inner_join(
+    gene_re_overlap,
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  )
+  # group_by(contrast) %>%
+  # mutate(
+  #   across(
+  #     c(log2FoldChange, log2FoldChange_MLE),
+  #     list(
+  #       quantiles = \(x) Hmisc::cut2(x, g = 10, digits = 2)
+  #     )
+  #   )
+  # ) %>%
+  # ungroup()
+
+library(furrr)
+plan(multicore(workers = 4))
+dsrip_re_cor <- dsrip_re_cor_data %>%
+  group_nest(class_family, contrast) %>%
+  mutate(
+    cor_raw = future_map(
+      data,
+      \(x) cor.test(~log2FoldChange + density, data = x, method = "kendall"),
+      .progress = TRUE
+    )
+  )
+  # summarize(
+  #   cor_raw = cor.test(~log2FoldChange + density, data = cur_data(), method = "kendall") %>%
+  #     list(),
+  #   .groups = "drop"
+  # )
+
+
+dsrip_re_cor_long <- dsrip_re_cor %>%
+  select(-data) %>%
+  mutate(across(cor_raw, \(x) map(x, broom::tidy))) %>%
+  unnest(cor_raw) %>%
+  mutate(
+    padj = p.adjust(p.value, method = "fdr")
+  )
+
+write_csv(
+  dsrip_re_cor_long,
+  here("dsrna", "dsrip_deseq_re_enrichment_cor.csv.gz")
+)
+```
+
+
+```{r}
+synStoreMany(
+  here("dsrna", "dsrip_deseq_re_enrichment_cor.csv.gz"),
+  parentId = "syn63099319",
+  forceVersion = FALSE
+)
+
+```
+
+```{r}
+p <- dsrip_re_cor_long %>%
+  transmute(class_family, contrast, estimate, signed_p = -sign(estimate) * log10(padj)) %>%
+  pivot_wider(
+    names_from = contrast,
+    values_from = c(estimate, signed_p)
+  ) %>%
+  ggplot(
+    aes(
+      signed_p_assay_RIP_vs_Total, signed_p_populationC9.assayRIP,
+      text = paste(
+        "class_family: ", class_family
+      )
+    )
+  ) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(alpha = .5, shape = 16) +
+  coord_equal()
+
+ggsave(
+  here("dsrna", "plots", "dsrip_re_enrichment_cor_rip_effect_vs_interaction_signed_p.pdf"),
+  p,
+  width = 10,
+  height = 5
+)
+
+library(plotly)
+
+ggp <- ggplotly(p)
+
+# Save as html
+htmlwidgets::saveWidget(
+  ggp,
+  here("dsrna", "plots", "dsrip_re_enrichment_cor_rip_effect_vs_interaction_signed_p.html"),
+  selfcontained = TRUE
+)
+
+p <- dsrip_re_cor_long %>%
+  transmute(class_family, contrast, estimate, signed_p = -sign(estimate) * log10(padj), padj) %>%
+  pivot_wider(
+    names_from = contrast,
+    values_from = c(estimate, signed_p, padj)
+  ) %>%
+  mutate(
+    significant = case_when(
+      padj_assay_RIP_vs_Total < 0.05 & padj_populationC9.assayRIP < 0.05 ~ "both",
+      padj_assay_RIP_vs_Total < 0.05 ~ "RIP_vs_Total",
+      padj_populationC9.assayRIP < 0.05 ~ "populationC9.assayRIP",
+      TRUE ~ "none"
+    ) %>%
+    factor(levels = c("none", "RIP_vs_Total", "populationC9.assayRIP", "both"))
+  ) %>%
+  ggplot(
+    aes(
+      estimate_assay_RIP_vs_Total, estimate_populationC9.assayRIP,
+      text = paste(
+        "class_family: ", class_family
+      )
+    )
+  ) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(aes(color = significant), alpha = .5, shape = 16) +
+  scale_color_manual(
+    values = c(
+      "none" = "black",
+      "RIP_vs_Total" = "blue",
+      "populationC9.assayRIP" = "red",
+      "both" = "purple"
+    )
+  ) +
+  coord_equal()
+
+ggsave(
+  here("dsrna", "plots", "dsrip_re_enrichment_cor_rip_effect_vs_interaction_estimate.pdf"),
+  p,
+  width = 10,
+  height = 5
+)
+
+ggp <- ggplotly(p)
+htmlwidgets::saveWidget(
+  ggp,
+  here("dsrna", "plots", "dsrip_re_enrichment_cor_rip_effect_vs_interaction_estimate.html"),
+  selfcontained = TRUE
+)
+```
+
+
+```{r}
+p <- dsrip_re_cor_data %>%
+  filter(
+    class_family == "LINE/L1",
+    contrast == "assay_RIP_vs_Total"
+  ) %>%
+  ggplot(
+    aes(
+      x = log2FoldChange,
+      y = n,
+      color = expression
+    )
+  ) +
+  geom_point(alpha = 0.5)
+
+p <- dsrip_re_cor_data %>%
+  filter(
+    class_family == "LINE/L1",
+    contrast == "assay_RIP_vs_Total"
+  ) %>%
+  ggplot(
+    aes(
+      x = rank(log2FoldChange),
+      y = density,
+      color = expression
+    )
+  ) +
+  geom_point(alpha = 0.5)
+
+```
+
+```{r}
+library(ggbeeswarm)
+ps <- dsrip_re_cor_data %>%
+  mutate(expression = factor(expression, levels = c("ns", "down", "up"))) %>%
+  arrange(expression) %>%
+  group_nest(
+    contrast
+  ) %>%
+  mutate(
+    p = map(
+      data,
+      \(x) ggplot(
+        x,
+        aes(
+          x = log2FoldChange_quantiles,
+          y = log_density
+        )
+      ) +
+      geom_hline(
+        aes(yintercept = log10(density_floor)),
+        data = \(x) distinct(x, class_family, density_floor),
+        linetype = "dashed"
+      ) +
+      ggrastr::rasterize(geom_quasirandom(
+        aes(color = expression),
+        shape = 16
+      ), dpi = 300) +
+      geom_boxplot(
+        color = "gray",
+        fill = NA,
+        outliers = FALSE
+      ) +
+      geom_text(
+        aes(
+          label = paste(signif(estimate, 2), signif(padj, 2))
+        ),
+        data = \(x) dsrip_re_cor_long,
+        x = -Inf,
+        y = Inf,
+        hjust = 0,
+        vjust = 1,
+        inherit.aes = FALSE
+      ) +
+      geom_segment(
+        aes(
+          x = stage(log2FoldChange_quantiles, x - 0.5), xend = stage(log2FoldChange_quantiles, after_scale = xend + 0.5),
+          y = log_density_mean, yend = log_density_mean
+        ),
+        data = \(x) x %>%
+          group_by(class_family, log2FoldChange_quantiles) %>%
+          summarize(log_density_mean = mean(log_density), .groups = "drop"),
+        color = "gray",
+        linetype = "dotted"
+      ) +
+      scale_color_manual(
+        values = c(
+          "ns" = alpha("black", .1),
+          "down" = alpha("blue", .5),
+          "up" = alpha("red", .5)
+        )
+      ) +
+      ggh4x::facet_wrap2(~class_family, scales = "free", axes = "all") +
+      theme(axis.text.x = element_blank()) +
+      labs(
+
+      )
+    )
+  )
+
+pwalk(
+  ps,
+  \(p, contrast, ...) {
+    message(contrast)
+    ggsave(
+      here("dsrna", "plots", paste0("dsrip_re_enrichment_quantiles_", str_replace(contrast, "[^\\w]+", "_"), ".pdf")),
+      p +
+        labs(title = contrast),
+      width = 15,
+      height = 10
+    )
+  }
+)
+
+dir.create(here("dsrna", "plots"), showWarnings = FALSE)
+ggsave(
+  here("dsrna", "plots", "dsrip_re_enrichment_quantiles.pdf"),
+  p,
+  width = 15,
+  height = 10
+)
+```
+
+
+
+
+```{r}
+p <- dsrip_re_cor_data %>%
+  filter(
+    class_family == "LINE/L1",
+    contrast == "assay_RIP_vs_Total"
+  ) %>%
+  ggplot(
+    aes(
+      x = log2FoldChange,
+      y = n,
+      color = expression
+    )
+  ) +
+  geom_point(alpha = 0.5)
+
+p <- dsrip_re_cor_data %>%
+  filter(
+    class_family == "LINE/L1",
+    contrast == "assay_RIP_vs_Total"
+  ) %>%
+  ggplot(
+    aes(
+      x = rank(log2FoldChange),
+      y = density,
+      color = expression
+    )
+  ) +
+  geom_point(alpha = 0.5)
+
+```
+
+```{r}
+library(ggbeeswarm)
+ps <- dsrip_re_cor_data %>%
+  mutate(expression = factor(expression, levels = c("ns", "down", "up"))) %>%
+  arrange(expression) %>%
+  group_nest(class_family, keep = TRUE) %>%
+  mutate(
+    p = map2(
+      data, class_family,
+      \(d, rc) ggplot(
+        d,
+        aes(
+          x = log2FoldChange_quantiles,
+          y = log_density
+        )
+      ) +
+      geom_hline(
+        aes(yintercept = log10(density_floor)),
+        data = \(x) distinct(x, class_family, density_floor),
+        linetype = "dashed"
+      ) +
+      ggrastr::rasterize(geom_quasirandom(
+        aes(color = expression),
+        shape = 16
+      ), dpi = 300) +
+      geom_boxplot(
+        color = "gray",
+        fill = NA,
+        outliers = FALSE,
+        coef = 0
+      ) +
+      geom_text(
+        aes(
+          label = paste(signif(estimate, 2), signif(padj, 2))
+        ),
+        data = \(x) filter(dsrip_re_cor_long, class_family == rc),
+        x = -Inf,
+        y = Inf,
+        hjust = 0,
+        vjust = 1,
+        inherit.aes = FALSE
+      ) +
+      geom_segment(
+        aes(
+          x = stage(log2FoldChange_quantiles, x - 0.5), xend = stage(log2FoldChange_quantiles, after_scale = xend + 0.5),
+          y = log_density_mean, yend = log_density_mean
+        ),
+        data = \(x) x %>%
+          group_by(class_family, log2FoldChange_quantiles) %>%
+          summarize(log_density_mean = mean(log_density), .groups = "drop"),
+        color = "gray",
+        linetype = "dotted"
+      ) +
+      scale_color_manual(
+        values = c(
+          "ns" = alpha("black", .1),
+          "down" = alpha("blue", .5),
+          "up" = alpha("red", .5)
+        )
+      ) +
+      theme(axis.text.x = element_blank()) +
+      labs(
+        x = "log2FoldChange deciles",
+        y = "log10 repeat density (per bp)"
+      )
+    )
+  )
+
+dir.create(here("dsrna", "plots", "dsrip_re_enrichment_plots"), showWarnings = FALSE)
+pwalk(
+  ps,
+  function(p, class_family, ...) {
+    message(class_family)
+    # browser()
+    ggsave(
+      here("dsrna", "plots", "dsrip_re_enrichment_plots", paste0("dsrip_re_enrichment_quantiles_", str_replace(class_family, "[^\\w]+", "_"), ".pdf")),
+      p +
+        labs(title = class_family),
+      width = 4.5,
+      height = 3.5
+    )
+  }
+)
+```
