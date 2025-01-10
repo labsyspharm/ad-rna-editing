@@ -83,8 +83,6 @@ dds <- DESeqDataSetFromTximport(
   design = ~ population + assay + population:assay + company
 ) %>%
   DESeq()
-
-
 ```
 
 ```{r}
@@ -133,7 +131,7 @@ extract_deseq_result <- function(de, contrast, name) {
   if (missing(contrast)) {
     res <- results(de, name = name)
   } else {
-    res <- resu?relts(de, contrast = contrast)
+    res <- results(de, contrast = contrast)
   }
   shrunken <- lfcShrink(de, res = res, type = "ashr")
   shrunken %>%
@@ -173,9 +171,9 @@ res <- bind_rows(res_raw, .id = "contrast") %>%
 
 write_csv(
   res,
-  here("dsrna", "data", "dsrip_deseq_results.csv.gz")
+  here("dsrna", "data", "dsrip_deseq_results_ints.csv.gz")
 )
-# res <- read_csv(here("dsrna", "data", "dsrip_deseq_results.csv.gz"))
+# res <- read_csv(here("dsrna", "data", "dsrip_deseq_results_ints.csv.gz"))
 ```
 
 Pairwise results
@@ -211,6 +209,7 @@ write_csv(
   res_pairwise,
   here("dsrna", "data", "dsrip_deseq_pairwise_results.csv.gz")
 )
+# res_pairwise <- read_csv(here("dsrna", "data", "dsrip_deseq_pairwise_results.csv.gz"))
 ```
 
 
@@ -523,8 +522,152 @@ p <- counts_trans_long %>%
 
 
 ggsave(
-  here("dsrna", "plots", "dsrip_populationC9.assayRIP_rlog_boxplot.pdf"),
+  here("dsrna", "plots", "dsrip_populationC9.assayRIP_rlog_boxplot_int.pdf"),
   p, width = 3.5, height = 5
 )
 ```
 
+Looking at some genes significant in direct comparison by Chan Core
+
+```{r}
+library(jsonlite)
+direct_comp_chan_raw <- fromJSON("/Users/chug/HMS Dropbox/Clemens Hug/hbc_dsRNAseq_Albers_hbc04584/reports/DE/DEG_report_direct_comparison_data.json")
+
+direct_comp_chan <- as_tibble(
+  t(direct_comp_chan_raw$x$data) %>%
+    magrittr::set_colnames(
+      c("row", "hgnc_symbol", "gene_id", "baseMean", "log2FoldChange", "lfcSE", "pvalue", "padj", "pi", "symbol", "chr", "start", "end", "strand", "biotype", "description")
+    )
+) %>%
+  type_convert()
+```
+
+
+```{r}
+chan_exemplars <- tibble(
+  hgnc_symbol = c("TRIM59", "LUCAT1", "CSF2RA")
+)
+
+chan_exemplars <- direct_comp_chan %>%
+  filter(log2FoldChange > 0, padj < 0.05) %>%
+  arrange(pvalue) %>%
+  slice_head(n = 10) %>%
+  select(gene_id)
+
+ps <- counts_trans_long %>%
+  filter(transformation == "rlog") %>%
+  power_inner_join(
+    chan_exemplars,
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(sample_id = factor(sample_id, levels = levels(meta_fct$sample_id))) %>%
+  power_left_join(
+    meta_fct,
+    by = "sample_id",
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn",
+    )
+  ) %>%
+  mutate(
+    gene_name = coalesce(hgnc_symbol, gene_id)
+  ) %>%
+  ggplot(
+    aes(x = population, y = count, color = assay, shape = company)
+   ) +
+    geom_quasirandom(
+      dodge.width = .75
+    ) +
+    stat_summary(
+      aes(group = assay),
+      fun = mean,
+      geom = "crossbar",
+      width = 0.5,
+      position = position_dodge(width = 0.75)
+    ) +
+    geom_line(
+      aes(
+        x = stage(
+          start = population,
+          after_stat = x - if_else(colour == "Total", 0.1875, -.1875)
+        ),
+        group = interaction(company, population)
+      ),
+      data = \(x) group_by(x, gene_name, assay, company, population) %>%
+        summarise(count = mean(count), .groups = "drop")
+    ) +
+    facet_wrap(vars(gene_name), scales = "free") +
+    scale_color_manual(
+      values = c(
+        "Total" = "black",
+        "RIP" = "red"
+      )
+    ) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+    )
+ps
+ggsave(
+  here("dsrna", "plots", "dsrip_chan_exemplars_rlog_counts.pdf"),
+  ps, width = 8, height = 6
+)
+
+ps <- counts_trans_long %>%
+  filter(transformation == "rlog") %>%
+  power_inner_join(
+    chan_exemplars,
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(sample_id = factor(sample_id, levels = levels(meta_fct$sample_id))) %>%
+  power_left_join(
+    meta_fct,
+    by = "sample_id",
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn",
+    )
+  ) %>%
+  mutate(
+    gene_name = coalesce(hgnc_symbol, gene_id)
+  ) %>%
+  ggplot(
+    aes(x = population, y = count, color = assay)
+   ) +
+    geom_quasirandom(
+      dodge.width = .75
+    ) +
+    stat_summary(
+      aes(group = assay),
+      fun = mean,
+      geom = "crossbar",
+      width = 0.5,
+      position = position_dodge(width = 0.75)
+    ) +
+    ggh4x::facet_grid2(vars(company), vars(gene_name), scales = "free", independent = "y") +
+    scale_color_manual(
+      values = c(
+        "Total" = "black",
+        "RIP" = "red"
+      )
+    ) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+    )
+
+ggsave(
+  here("dsrna", "plots", "dsrip_chan_exemplars_rlog_counts_facet.pdf"),
+  ps, width = 12, height = 3.5
+)
+```
