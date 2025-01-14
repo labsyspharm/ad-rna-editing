@@ -1,0 +1,282 @@
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(powerjoin)
+library(qs)
+library(ggbeeswarm)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+
+```{r}
+sprint_all <- syn("syn64376905") %>%
+  data.table::fread() %>%
+  as_tibble()
+
+```
+
+
+```{r}
+sprint_all_agg <- sprint_all %>%
+  group_by(
+    `repeat`, sample_id, pathology
+  ) %>%
+  summarise(
+    nedited = sum(nedited),
+    unedited = sum(unedited),
+    .groups = "drop"
+  )
+
+
+```
+
+
+```{r}
+count(sprint_all, `repeat`)
+count(sprint_all, `family`)
+```
+
+```{r}
+library(lme4)
+library(lmerTest)
+library(broom)
+library(broom.mixed)
+```
+
+## Proportion test
+
+## Agg
+
+```{r}
+prop_test_repeat_agg <- sprint_all_agg %>%
+  group_nest(
+    `repeat`
+  ) %>%
+  mutate(
+    mod = map2(
+      data, `repeat`,
+      \(x, y) {
+        message(y)
+        r <- safely(glm)(
+          cbind(nedited, unedited) ~ pathology,
+          data = x,
+          family = binomial
+        )
+        message(as.character(r$error))
+        r
+      }
+    )
+  )
+
+prop_test_repeat_agg_res <- prop_test_repeat_agg %>%
+  mutate(
+    res = map(mod, \(x) if (!is.null(x$result)) tidy(x$result) else NULL)
+  ) %>%
+  select(-data, -mod) %>%
+  unnest(res)
+
+```
+
+```{r}
+p <- prop_test_repeat_agg_res %>%
+  filter(
+    term == "pathologydisease",
+    !str_ends(`repeat`, fixed("?"))
+  ) %>%
+  arrange(estimate) %>%
+  mutate(
+    `repeat` = fct_inorder(`repeat`)
+  ) %>%
+  ggplot(
+    aes(
+      estimate,
+      `repeat`
+    )
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_errorbarh(
+    aes(xmin = estimate - std.error, xmax = estimate + std.error)
+  ) +
+  geom_point(
+    aes(fill = p.value < 0.05),
+    shape = 21,
+    color = "black",
+  ) +
+  scale_fill_manual(
+    values = c(`TRUE` = "black", `FALSE` = "grey")
+  ) +
+  labs(
+     x = "Log odds ratio edit rate",
+     y = NULL
+  )
+
+dir.create("sprint_analysis", showWarnings = FALSE)
+ggsave(
+  "sprint_analysis/prop_test_glmm_repeat.pdf",
+  p,
+  width = 8, height = 6
+)
+
+```
+
+
+## Individual
+
+```{r}
+
+prop_test_repeat <- sprint_all %>%
+  group_nest(
+    `repeat`
+  ) %>%
+  filter(
+    map_lgl(data, \(x) nrow(x) > 10)
+  ) %>%
+  mutate(
+    mod = map2(
+      data, `repeat`,
+      \(x, y) {
+        message(y)
+        r <- safely(glmer)(
+          cbind(nedited, unedited) ~ 1 + pathology + (1 | repeat_id),
+          data = x,
+          family = binomial,
+          verbose = 1
+        )
+        message(as.character(r$error))
+        r
+      }
+    )
+  )
+
+qsave(
+  prop_test_repeat,
+  "prop_test_repeat_raw.qs"
+)
+```
+
+
+```{r}
+prop_test_repeat_res <- prop_test_repeat %>%
+  mutate(
+    res = map(mod, \(x) if (!is.null(x$result)) tidy(x$result) else NULL)
+  ) %>%
+  select(-data, -mod) %>%
+  unnest(res)
+
+
+prop_test_repeat_res %>%
+  filter(term == "pathologydisease") %>%
+  View()
+```
+
+```{r}
+p <- prop_test_repeat_res %>%
+  filter(
+    term == "pathologydisease",
+    !str_ends(`repeat`, fixed("?"))
+  ) %>%
+  arrange(estimate) %>%
+  mutate(
+    `repeat` = fct_inorder(`repeat`)
+  ) %>%
+  ggplot(
+    aes(
+      estimate,
+      `repeat`
+    )
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_errorbarh(
+    aes(xmin = estimate - std.error, xmax = estimate + std.error)
+  ) +
+  geom_point(
+    aes(fill = p.value < 0.05),
+    shape = 21,
+    color = "black",
+  ) +
+  scale_fill_manual(
+    values = c(`TRUE` = "black", `FALSE` = "grey")
+  ) +
+  labs(
+     x = "Log odds ratio edit rate",
+     y = NULL
+  )
+
+dir.create("sprint_analysis", showWarnings = FALSE)
+ggsave(
+  "sprint_analysis/prop_test_glmm_repeat.pdf",
+  p,
+  width = 8, height = 6
+)
+ ```
+
+## Compare agg vs individual
+
+```{r}
+prop_test_repeat_comp <- bind_rows(
+  agg = prop_test_repeat_agg_res,
+  ind = prop_test_repeat_res,
+  .id = "type"
+)
+
+p <- prop_test_repeat_comp %>%
+  filter(
+    term == "pathologydisease",
+    !str_ends(`repeat`, fixed("?"))
+  ) %>%
+  select(type, `repeat`, estimate, std.error, p.value) %>%
+  pivot_wider(
+    names_from = type,
+    values_from = c(estimate, std.error, p.value)
+  ) %>%
+  ggplot(
+    aes(
+      estimate_agg,
+      estimate_ind,
+      text = `repeat`
+    )
+  ) +
+  geom_abline() +
+  geom_point()
+
+plotly::ggplotly(p)
+```
+
+
+```{r}
+prop_test_family <- sprint_all %>%
+  group_nest(
+    family
+  ) %>%
+  filter(
+    map_lgl(data, \(x) nrow(x) > 10)
+  ) %>%
+  mutate(
+    mod = map2(
+      data, family,
+      \(x, y) {
+        message(y)
+        r <- safely(glmer)(
+          cbind(nedited, unedited) ~ pathology + (1 | repeat_id) + (1 | sample_id),
+          data = x,
+          family = binomial
+        )
+        message(as.character(r$error))
+        r
+      }
+    )
+  )
+
+```
+
+
+1. Check overall number of editing events TDP-43 vs Control
+2. Compare absolute numbers
+3. Call highly edited sites with clusters of edits, do they lose editing in TDP-43?
+4. Check length of reads in original fastq files. Do we get reads shorter than 250bp?
+5.

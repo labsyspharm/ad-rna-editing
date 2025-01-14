@@ -127,7 +127,7 @@ salmon_tximport_filtered <- filter_tximport(
 ```{r}
 library(DESeq2)
 
-dds2 <- DESeqDataSetFromTximport(
+dds <- DESeqDataSetFromTximport(
   salmon_tximport_filtered,
   meta,
   design = ~ population + assay + population:assay + company
@@ -375,76 +375,6 @@ res %>% filter(padj < 0.1, contrast == "population_C9_vs_Ctrl") %>% View()
 res %>% filter(padj < 0.1, contrast == "populationC9.assayRIP") %>% View()
 ```
 
-
-Compare with old Chan core results
-
-
-```{r}
-als_rip_vs_total_chan <- syn("syn63099322") %>%
-  read_csv()
-
-chan_mine_comp <- res %>%
-  filter(contrast == "assay_RIP_vs_Total") %>%
-  power_left_join(
-    als_rip_vs_total_chan %>%
-      distinct(gene_id, baseMean, log2FoldChange_MLE = lfc, lfcSE_MLE = lfcSE, pvalue, padj),
-    by = "gene_id",
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    ),
-    suffix = c("_mine", "_chan")
-  ) %>%
-  mutate(
-    signed_logp_mine = -sign(log2FoldChange_MLE_mine) * log10(pvalue_mine),
-    signed_logp_chan = -sign(log2FoldChange_MLE_chan) * log10(pvalue_chan)
-  )
-```
-
-
-```{r}
-p <- chan_mine_comp %>%
-  ggplot(
-    aes(x = signed_logp_chan, y = signed_logp_mine)
-  ) +
-  ggrastr::rasterize(geom_point(alpha = 0.5, shape = 16), dpi = 300)
-
-ggsave(
-  here("dsrna", "plots", "dsrip_rip_vs_total_chan_mine_comparison.pdf"),
-  p, width = 4, height = 4
-)
-
-cor.test(
-  ~ signed_logp_chan + signed_logp_mine, data = chan_mine_comp, method = "kendall"
-)
-
-cor.test(
-  ~ signed_logp_chan + signed_logp_mine, data = chan_mine_comp, method = "pearson"
-)
-```
-
-
-## Spot check differentially expressed genes
-
-```{r}
-exemplar_genes <- withr::with_seed(
-  42,
-  res %>%
-    filter(padj < 0.05, contrast %in% c("population_C9_vs_Ctrl", "assay_RIP_vs_Total", "populationC9.assayRIP")) %>%
-    group_by(contrast, log2FoldChange_MLE > 0) %>%
-    arrange(pvalue) %>%
-    slice_head(n = 30) %>%
-    slice_sample(n = 3) %>%
-    ungroup() %>%
-    mutate(
-      gene_name = coalesce(hgnc_symbol, gene_id)
-    )
-)
-
-counts_trans_long <- counts_trans %>%
-  pivot_longer(-c(transformation, gene_id), names_to = "sample_id", values_to = "count")
-```
 
 ```{r}
 library(ggbeeswarm)
