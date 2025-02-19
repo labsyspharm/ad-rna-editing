@@ -1,0 +1,87 @@
+```{r setup, include=FALSE}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(powerjoin)
+library(qs)
+library(Rsubread)
+library(synExtra)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+
+```{r}
+rm_raw <- syn("syn55256576") %>%
+  read_csv()
+
+liu_meta <- syn("syn36639762") %>%
+  read_csv()
+```
+
+
+```{r}
+bam_files <- tibble(
+  fastq_path = Sys.glob(
+    file.path("star_salmon", "*.sorted.bam")
+  )
+) %>%
+  filter(!str_detect(fastq_path, fixed("markdup"))) %>%
+  mutate(
+    sample_id = str_extract(fastq_path, "([^/]+)\\.sorted\\.bam", group = 1)
+  ) %>%
+  power_inner_join(
+    liu_meta,
+    by = c("sample_id" = "Run"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn",
+      duplicate_keys_left = "warn"
+    )
+  )
+
+```
+
+
+```{r}
+repeats_saf <- rm_raw %>%
+  transmute(
+    GeneID = paste(rep_name, row_number(), sep = "_"),
+    Chr = chromosome,
+    Start = start,
+    End = end,
+    Strand = case_when(
+      strand == "+" ~ "+",
+      strand == "C" ~ "-",
+      TRUE ~ "*"
+    )
+  )
+
+fc_results <- featureCounts(
+  files = bam_files$fastq_path,
+  annot.ext = repeats_saf,
+  isGTFAnnotationFile = FALSE,
+  allowMultiOverlap = TRUE,
+  isPairedEnd = TRUE,
+  nthreads = 8
+)
+
+qsave(
+  fc_results,
+  "liu_repeat_counts_raw.qs"
+)
+
+```
+
+```{r}
+syn_repeat <- synMkdir("syn36639270", "Repeats")
+
+synStoreMany(
+  "liu_repeat_counts_raw.qs",
+  syn_repeat,
+  forceVersion = FALSE
+)
+```
+
