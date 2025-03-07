@@ -6,6 +6,7 @@ library(powerjoin)
 library(qs)
 library(ggbeeswarm)
 library(Rsubread)
+library(GenomicRanges)
 
 synapser::synLogin()
 syn <- synExtra::synDownloader(normalizePath("~/data"), .cache = TRUE)
@@ -40,12 +41,13 @@ raw_sprint_long <- raw_sprint %>%
   select(run_id, data) %>%
   unnest(data) %>%
   select(-start) %>%
-  rename(position = end)
+  dplyr::rename(position = end)
 
 write_csv(
   raw_sprint_long,
   "raw_sprint_long.csv.gz"
 )
+# raw_sprint_long <- read_csv("raw_sprint_long.csv.gz")
 ```
 
 0-based exclusive to 1-based
@@ -57,14 +59,6 @@ sprint_unique_sites <- raw_sprint_long %>%
     start = position,
     end = position
   )
-
-# sprint_unique_granges <- sprint_unique_sites %>%
-#   GenomicRanges::makeGRangesFromDataFrame()
-
-# rtracklayer::export.bed(
-#   sprint_unique_granges,
-#   "sprint_unique.bed"
-# )
 ```
 
 
@@ -115,78 +109,92 @@ synStoreMany(
   forceVersion = FALSE
 )
 
-# sprint_counts_long <- fc_results$counts %>%
-#   as_tibble() %>%
-#   rename_with(
-#     \(x) str_remove(x, fixed(".sorted.bam"))
-#   )
 ```
 
 ```{r}
-# library(processx)
+raw_sprint_long <- syn("syn64868813") %>%
+  read_csv()
 
-# sprint_coverage_out_path <- tempfile()
-# run(
-#   "multiBamSummary",
-#   c(
-#     "BED-file",
-#     "--BED", "sprint_unique.bed",
-#     "--bamfiles", bam_files$bam_path,
-#     "--labels", bam_files$sample_id,
-#     "-p", 8,
-#     "-v",
-#     "--outRawCounts", sprint_coverage_out_path
-#   ),
-#   echo_cmd = TRUE,
-#   stderr = "",
-#   stdout = ""
-# )
+liu_unique_sprint_counts <- syn("syn64868808") %>%
+  qread()
+
+repeatmasker_raw <- syn("syn55256576") %>%
+  read_csv()
 ```
 
 
 ```{r}
-# repeats_saf <- rm_raw %>%
-#   transmute(
-#     GeneID = paste(rep_name, row_number(), sep = "_"),
-#     Chr = chromosome,
-#     Start = start,
-#     End = end,
-#     Strand = case_when(
-#       strand == "+" ~ "+",
-#       strand == "C" ~ "-",
-#       TRUE ~ "*"
-#     )
-#   )
 
-# fc_results <- featureCounts(
-#   files = bam_files$fastq_path,
-#   annot.ext = repeats_saf,
-#   isGTFAnnotationFile = FALSE,
-#   allowMultiOverlap = TRUE,
-#   isPairedEnd = TRUE,
-#   nthreads = 8
-# )
+# Convert to GRanges objects
+sprint_gr <- sprint_unique_sites %>%
+  GenomicRanges::makeGRangesFromDataFrame()
 
-# qsave(
-#   fc_results,
-#   "liu_repeat_counts_raw.qs"
-# )
+repeatmasker_gr <- repeatmasker_raw %>%
+  transmute(
+    chromosome = str_remove(chromosome, fixed("chr")),
+    start, end,
+    strand = if_else(
+      strand == "+",
+      "+",
+      "-"
+    )
+  ) %>%
+  GenomicRanges::makeGRangesFromDataFrame()
 
+# Find overlaps
+overlaps <- GenomicRanges::findOverlaps(
+  sprint_gr, repeatmasker_gr
+) %>%
+  as_tibble()
 
-# library(processx)
+# Join with original data
+sprint_repeat_overlaps <- sprint_unique_sites %>%
+  select(-end) %>%
+  dplyr::rename(position = "start") %>%
+  mutate(
+    site_id = row_number()
+  ) %>%
+  power_left_join(
+    overlaps,
+    by = c("site_id" = "queryHits"),
+    check = check_specs(
+      unmatched_keys_right = "warn"
+    )
+  ) %>%
+  power_left_join(
+    raw_sprint_long,
+    by = c("chrom", "position"),
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  power_left_join(
+    repeatmasker_raw %>%
+      mutate(repeat_id = row_number()) %>%
+      select(
+        repeat_id,
+        rep_name, class_family,
+        repeat_start = start, repeat_end = end,
+        repeat_strand = strand
+      ),
+    by = c("subjectHits" = "repeat_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  select(
+    -c(site_id, subjectHits)
+  )
 
-# pileup_out_path <- tempfile()
-# run(
-#   "samtools",
-#   args = c(
-#     "mpileup",
-#     "-f", normalizePath("~/scratch/annotation/Homo_sapiens.GRCh38.dna.primary_assembly.fa"),
-#     "-d", "0",
-#     bam_files$bam_path
-#   ),
-#   echo_cmd = TRUE,
-#   stderr = "",
-#   stdout = pileup_out_path
-# )
+write_csv(
+  sprint_repeat_overlaps,
+  here("dsrna", "data", "sprint_repeat_overlaps.csv.gz")
+)
 
+synStoreMany(
+  here("dsrna", "data", "sprint_repeat_overlaps.csv.gz"),
+  parentId = "syn64376902",
+  forceVersion = FALSE
+)
 ```
