@@ -5,44 +5,47 @@ library(data.table)
 synapser::synLogin()
 syn <- synDownloader("~/data", .cache = TRUE)
 
-rm_tar_path <- syn("syn55256520")
-
-untar(
-  rm_tar_path,
-  exdir = "repeatmasker_raw"
-)
-
-rm_raw_files <- list.files(
-  "repeatmasker_raw/Human.RepeatMasker.map", full.names = TRUE, pattern = "chr.+out$"
+dsrid_raw_files <- Sys.glob(
+  "*/dsRID_prediction_randomf.tsv"
 ) %>%
-  set_names(
-    str_match(., "(chr[0-9XYM]+)\\.fa\\.out")[, 2]
+  str_subset("pred_test", negate = TRUE) %>%
+  tibble(file_path = .) %>%
+  mutate(
+    sample_id = str_match(
+      file_path, "^(.+)\\.fastq\\.gz"
+    )[, 2],
+    chromosome = str_match(
+      file_path, "(chr[0-9XYM]+)/"
+    )[, 2],
+    raw = map(
+      file_path,
+      read_tsv
+    )
   )
 
-rm_raw <- map(
-  rm_raw_files,
-  \(x) read_table(
-    x,
-    col_names = c(
-      "sw_score", "perc_div", "perc_del", "perc_ins",
-      "chromosome", "start", "end", "left", "strand",
-      "rep_name", "class_family", "rep_start", "rep_end",
-      "rep_left", "id", "dummy"
-    ),
-    skip = 2
+dsrid_raw_concat <- dsrid_raw_files %>%
+  group_by(sample_id) %>%
+  summarize(
+    raw = bind_rows(raw) %>%
+      list(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    file_path = paste0(sample_id, "_dsRID_prediction_randomf.csv.gz")
   )
-)
 
-raw_concat <- bind_rows(rm_raw)
-
-write_csv(
-  raw_concat,
-  "repeatmasker_raw/repeatmasker_raw.csv.gz"
+pwalk(
+  dsrid_raw_concat,
+  \(raw, file_path, ...) {
+    write_csv(
+      raw,
+      file_path
+    )
+  }
 )
 
 synStoreMany(
-  "repeatmasker_raw/repeatmasker_raw.csv.gz",
-  parentId = "syn55256519",
-  forceVersion = FALSE,
-  used = "https://www-girinst-org.ezp-prod1.hul.harvard.edu/downloads/repeatmaskedgenomes/"
+  dsrid_raw_concat$file_path,
+  parentId = "syn55256638",
+  forceVersion = FALSE
 )

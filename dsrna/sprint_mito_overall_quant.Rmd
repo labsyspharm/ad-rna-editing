@@ -1,0 +1,102 @@
+```{r setup, include=FALSE}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(powerjoin)
+library(qs)
+library(ggbeeswarm)
+library(ggrepel)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+
+```{r}
+sprint_all <- syn("syn64868813") %>%
+  read_csv()
+
+liu_meta <- syn("syn65596451") %>%
+  read_csv()
+```
+
+
+```{r}
+if (!file.exists(here("Homo_sapiens.GRCh38.113.gtf.gz")))
+  download.file(
+    "https://ftp.ensembl.org/pub/release-113/gtf/homo_sapiens/Homo_sapiens.GRCh38.113.gtf.gz",
+    here("Homo_sapiens.GRCh38.113.gtf.gz")
+  )
+
+gene_annotation_gr <- rtracklayer::readGFF(
+  here("Homo_sapiens.GRCh38.113.gtf.gz"),
+  filter = list(type = "gene")
+) %>%
+  GenomicRanges::makeGRangesFromDataFrame(
+    keep.extra.columns = TRUE
+  )
+
+gene_annotation_mit_gr <- gene_annotation_gr[
+  GenomicRanges::seqnames(gene_annotation_gr) == "MT"
+]
+```
+
+
+```{r}
+sprint_unique_sites <- sprint_all %>%
+  distinct(
+    chrom,
+    start = position,
+    end = position
+  )
+
+sprint_unique_gr <- sprint_unique_sites %>%
+  GenomicRanges::makeGRangesFromDataFrame()
+
+# Find overlaps
+overlaps <- GenomicRanges::findOverlaps(
+  sprint_unique_gr, gene_annotation_mit_gr
+) %>%
+  as_tibble()
+
+# Join with original data
+sprint_mito_overlaps <- sprint_unique_sites %>%
+  select(-end) %>%
+  dplyr::rename(position = "start") %>%
+  mutate(
+    site_id = row_number()
+  ) %>%
+  power_inner_join(
+    overlaps,
+    by = c("site_id" = "queryHits"),
+    check = check_specs(
+      unmatched_keys_right = "warn"
+    )
+  ) %>%
+  power_inner_join(
+    sprint_all,
+    by = c("chrom", "position"),
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  power_inner_join(
+    gene_annotation_mit_gr %>%
+      as_tibble() %>%
+      transmute(
+        gene_seq_id = row_number(),
+        gene_id, gene_name,
+        gene_start = start, gene_end = end,
+        gene_strand = strand
+      ),
+    by = c("subjectHits" = "gene_seq_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  select(
+    -c(site_id, subjectHits)
+  )
+
+
+```
