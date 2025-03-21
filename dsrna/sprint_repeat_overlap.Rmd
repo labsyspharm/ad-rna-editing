@@ -24,17 +24,43 @@ liu_repeat_counts <- syn("syn64829593") %>%
 
 rm_raw <- syn("syn55256576") %>%
   read_csv()
+
+liu_meta <- syn("syn65596451") %>%
+  read_csv()
 ```
+
+Only include LTRs, LINEs, SINEs
+
+Exclude
+* Tx1 (only xenopus)
+* Dong (arthropods)
+* Penelope (drosophila)
+* 5S-Deu-L2 (most likely non-functional)
+* RTE-BovB (bovine)
+* Gypsy (misclassified ERV)
+* RTE-X (nematodes - reptiles, misclassified in humans)
+* CR1 (avian)
+* Jockey (insects, ancient, misclassified)
 
 ```{r}
 repeat_whitelist <- rm_raw %>%
   distinct(class_family) %>%
   filter(
     !str_detect(class_family, coll("?")),
+    !str_detect(class_family, coll("Jockey")),
+    !str_detect(class_family, coll("Tx1")),
+    !str_detect(class_family, coll("Dong")),
+    !str_detect(class_family, coll("Penelope")),
+    !str_detect(class_family, coll("5S-Deu-L2")),
+    !str_detect(class_family, coll("tRNA-Deu")),
+    !str_detect(class_family, coll("tRNA-RTE")),
+    !str_detect(class_family, coll("RTE-BovB")),
+    !str_detect(class_family, coll("Gypsy")),
+    !str_detect(class_family, coll("RTE-X")),
+    !str_detect(class_family, coll("CR1")),
     str_starts(class_family, coll("LTR")) |
       str_starts(class_family, coll("SINE")) |
-      str_starts(class_family, coll("LINE")) |
-      str_starts(class_family, coll("LTR"))
+      str_starts(class_family, coll("LINE"))
   )
 
 ```
@@ -108,89 +134,13 @@ library(broom)
 library(broom.mixed)
 ```
 
-## Quantify library sizes
-
-https://support.bioconductor.org/p/130564/#130568
-
-```{r}
-liu_salmon <- syn("syn64756732") %>%
-  qread()
-
-liu_meta_raw <- syn("syn36639762") %>%
-  read_csv() %>%
-  slice(
-    match(
-      colnames(liu_salmon$abundance),
-      Run
-    )
-  )
-```
-
-Figure out paired sample info
-
-```{r}
-library(rentrez)
-library(xml2)
-sra_search <- entrez_search(db = "sra", term = "PRJNA522295")
-sra_runinfo <- entrez_fetch(db = "sra", id = sra_search$ids, rettype = "xml") %>%
-  read_xml()
-
-sra_meta <- map(
-  set_names(c("accession", "sample_name", "sample_title")),
-  \(x) xml_attr(
-    xml_find_all(sra_runinfo, "//Member"),
-    x
-  )
-) %>%
-  as_tibble() %>%
-  distinct() %>%
-  mutate(
-    patient_sample_id = str_extract(sample_title, "S\\d+"),
-    tdp_43_status = str_extract(sample_title, "/(TDP-43 (?:negative|positive)) ", group = 1)
-  )
-
-liu_meta <- liu_meta_raw %>%
-  power_inner_join(
-    sra_meta,
-    by = c("Sample Name" = "sample_name"),
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn",
-      duplicate_keys_left = "warn"
-    )
-  )
-```
-
-
-Important we only find repeat instances here that are consistently differentially
-expressed across all patients. We only find about 1% of repeats to be differentially
-expressed, however, if instances are stochastically DE, then what we see might
-just be the overlap.
-
-```{r}
-liu_de <- DESeq2::DESeqDataSetFromTximport(
-  liu_salmon,
-  liu_meta,
-  design = ~ 1
-) %>%
-  DESeq2::estimateSizeFactors()
-
-liu_size_factors <- liu_de %>%
-  DESeq2::normalizationFactors() %>%
-  apply(2, \(x) exp(mean(log(x))))
-```
-
 ## Absolute levels
 
 ```{r}
 abs_test_data <- sprint_all_agg %>%
   semi_join(
-    liu_meta,
-    by = c("sample_id" = "Run")
-  ) %>%
-  filter(
-    class_family != ".",
-    !str_ends(class_family, fixed("?"))
+    repeat_whitelist,
+    by = "class_family"
   ) %>%
   bind_rows(
     group_by(
@@ -206,20 +156,8 @@ abs_test_data <- sprint_all_agg %>%
     )
   ) %>%
   power_inner_join(
-    enframe(
-      liu_size_factors,
-      name = "sample_id",
-      value = "size_factor"
-    ),
-    by = "sample_id",
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) %>%
-  power_inner_join(
     liu_meta %>%
-      select(Run, patient_sample_id, tdp_43_status),
+      select(Run, patient_sample_id, tdp_43_status, size_factor),
     by = c("sample_id" = "Run"),
     check = check_specs(
       unmatched_keys_left = "warn",
@@ -256,38 +194,23 @@ count_type_human_readable <- c(
 
 
 ```{r}
-selected_repeats <- filter(
-  abs_test_data_long,
-    type == "total_adjusted"
-  ) %>%
-  group_by(class_family) %>%
-  filter(
-    mean(value) > 1000,
-    all(abs_test_data_long$patient_sample_id %in% patient_sample_id)
-  ) %>%
-  ungroup() %>%
-  distinct(class_family)
-
 abs_test_paired_raw <- abs_test_data_long %>%
   semi_join(
-    ,
+    repeat_whitelist,
     by = "class_family"
   ) %>%
-  crossing(
-    trans = c("log10", "linear")
-  ) %>%
   mutate(
-    value = if_else(trans == "log10", log10(value), value)
+    across(value, log10)
   ) %>%
   pivot_wider(
     names_from = `tdp_43_status`,
-    values_from = -c(`tdp_43_status`, class_family, patient_sample_id, type, trans)
+    values_from = -c(`tdp_43_status`, class_family, patient_sample_id, type)
   ) %>%
   mutate(
     difference = `TDP-43 negative` - `TDP-43 positive`
   ) %>%
   group_by(
-    class_family, type, trans
+    class_family, type
   ) %>%
   summarise(
     res = list(
@@ -305,7 +228,7 @@ abs_test_paired_res <- abs_test_paired_raw %>%
   ) %>%
   unnest(res) %>%
   group_by(
-    type, trans
+    type
   ) %>%
   mutate(
     padj = p.adjust(p.value, method = "BH")
@@ -327,8 +250,7 @@ abs_test_paired_res %>%
 
 p <- abs_test_paired_res %>%
   filter(
-    type %in% c("nedited_adjusted", "unedited_adjusted", "total_adjusted"),
-    trans == "log10"
+    type %in% c("nedited_adjusted", "unedited_adjusted", "total_adjusted")
   ) %>%
   ggplot(
     aes(
@@ -347,28 +269,8 @@ p <- abs_test_paired_res %>%
     aes(p.value)
   ) +
   geom_histogram() +
-  facet_grid(vars(trans), vars(type), scales = "free")
+  facet_wrap(vars(type), scales = "free")
 
-
-abs_test_raw <- abs_test_data %>%
-  group_by(
-    `repeat`
-  ) %>%
-  summarise(
-    res = list(
-      possibly(lm)(
-        nedited_adjusted ~ pathology,
-        data = cur_data()
-      )
-    ),
-    .groups = "drop"
-  )
-
-abs_test_res <- abs_test_raw %>%
-  mutate(
-    across(res, \(x) map(x, tidy))
-  ) %>%
-  unnest(res)
 
 library(lme4)
 library(lmerTest)
@@ -409,10 +311,26 @@ s
 ```
 
 ```{r}
+patient_id_color_mapping <- liu_meta %>%
+  filter(
+    tdp_43_status == "TDP-43 positive"
+  ) %>%
+  distinct(patient_sample_id) %>%
+  arrange() %>%
+  pull(patient_sample_id) %>% {
+    set_names(
+      paletteer::paletteer_d("colorblindr::OkabeIto", length(.)),
+      .
+    )
+  }
+
 
 ps <- abs_test_data_long %>%
   filter(type %in% c("nedited_adjusted", "unedited_adjusted", "total_adjusted", "supporting_reads_adjusted")) %>%
-  semi_join(selected_repeats, by = "class_family") %>%
+  semi_join(
+    repeat_whitelist,
+    by = "class_family"
+  ) %>%
   group_by(
     type
   ) %>%
@@ -423,26 +341,39 @@ ps <- abs_test_data_long %>%
         pick(everything()),
         aes(
           tdp_43_status,
-          value
+          value,
+          color = patient_sample_id
         )
       ) +
       geom_line(
-        aes(group = patient_sample_id),
-        color = "black"
+        aes(group = patient_sample_id)
       ) +
-      geom_quasirandom(width = .3) +
+      geom_quasirandom(width = .1) +
+      scale_color_manual(
+        values = patient_id_color_mapping,
+        guide = "none"
+      ) +
+      ggnewscale::new_scale_color() +
       geom_text(
         aes(label = signif(padj, 2), color = padj < 0.05),
         x = -Inf, y = Inf,
         hjust = 0, vjust = 1,
         data = filter(
-            abs_test_paired_res,
-            type == cur_type,
-            trans == "log10"
-          )
+          abs_test_paired_res,
+          type == cur_type
+        ),
+        inherit.aes = FALSE
       ) +
-      scale_color_manual(values = c(`TRUE` = "red", `FALSE` = "black")) +
-      scale_y_log10() +
+      scale_color_manual(
+        values = c(`TRUE` = "red", `FALSE` = "black"),
+        guide = "none"
+      ) +
+      scale_y_log10(
+        expand = expansion(mult = c(.1, .2))
+      ) +
+      coord_cartesian(
+        clip = "off"
+      ) +
       ggh4x::facet_wrap2(~class_family, scales = "free_y", axes = "y") +
       theme(
         axis.text.x = element_text(angle = 45, hjust = 1)
@@ -463,8 +394,8 @@ pwalk(
   ps,
   \(p, type, ...)
     ggsave(
-      here("dsrna", "plots", "sprint_analysis", paste0("sprint_quants_scatter_wp_new_", type, ".pdf")),
-      p, width = 11, height = 8
+      here("dsrna", "plots", "sprint_analysis", paste0("sprint_quants_scatter_selected_", type, ".pdf")),
+      p, width = 6, height = 5
     )
 )
 ```
@@ -696,6 +627,9 @@ prop_test_family <- sprint_all %>%
 ```
 
 
+
+## Quantifying total reads on repeats
+
 1. Check overall number of editing events TDP-43 vs Control
 2. Compare absolute numbers
 3. Call highly edited sites with clusters of edits, do they lose editing in TDP-43?
@@ -735,14 +669,26 @@ des <- qread(file.path("dsrna", "data", "liu_repeat_de.qs"))
 ```
 
 ```{r}
-repeat_norm_counts <- counts(des, normalized = TRUE)
+repeat_all_counts <- list(
+  normalized = counts(des, normalized = TRUE),
+  raw = counts(des, normalized = FALSE)
+)
 
-repeat_norm_counts_family <- repeat_norm_counts %>%
-  as_tibble(rownames = "gene_id") %>%
+repeat_norm_counts_family <- repeat_all_counts %>%
+  map(\(x) as_tibble(x, rownames = "gene_id")) %>%
+  bind_rows(.id = "normalized") %>%
   pivot_longer(
-    -gene_id,
+    -c(normalized, gene_id),
     names_to = "sample_id",
     values_to = "count"
+  ) %>%
+  pivot_wider(
+    names_from = normalized,
+    values_from = count
+  ) %>%
+  dplyr::rename(
+    count = normalized,
+    raw_count = raw
   ) %>%
   power_inner_join(
     rm_raw %>%
@@ -764,13 +710,9 @@ repeat_norm_counts_family_agg <- repeat_norm_counts_family %>%
   ) %>%
   summarize(
     count = sum(count),
+    raw_count = sum(raw_count),
     .groups = "drop"
-  )
-```
-
-
-```{r}
-de_agg <- repeat_norm_counts_family_agg %>%
+  ) %>%
   semi_join(
     repeat_whitelist,
     by = "class_family"
@@ -784,7 +726,12 @@ de_agg <- repeat_norm_counts_family_agg %>%
       unmatched_keys_right = "warn",
       duplicate_keys_right = "warn"
     )
-  ) %>%
+  )
+```
+
+
+```{r}
+repeat_norm_counts_family_agg_long <- repeat_norm_counts_family_agg %>%
   select(class_family, count, patient_sample_id, tdp_43_status) %>%
   pivot_wider(
     names_from = tdp_43_status,
@@ -795,7 +742,7 @@ de_agg <- repeat_norm_counts_family_agg %>%
     lratio = log2(`TDP-43 negative` / `TDP-43 positive`)
   )
 
-de_agg_raw <- de_agg %>%
+de_agg_raw <- repeat_norm_counts_family_agg_long %>%
   group_by(
     class_family
   ) %>%
@@ -815,7 +762,7 @@ de_agg_raw <- de_agg %>%
   )
 
 
-de_agg_raw_lratio <- de_agg %>%
+de_agg_raw_lratio <- repeat_norm_counts_family_agg_long %>%
   group_by(
     class_family
   ) %>%
@@ -835,6 +782,161 @@ de_agg_raw_lratio <- de_agg %>%
     estimate_fc = 2^estimate
   )
 ```
+
+```{r}
+p <- de_agg_raw_lratio %>%
+  # arrange(estimate) %>%
+  mutate(
+    across(
+      class_family,
+      \(x) fct_reorder(x, estimate)
+    )
+  ) %>%
+  ggplot(
+    aes(
+      estimate,
+      class_family,
+      fill = padj < 0.05
+    )
+  ) +
+  geom_col() +
+  geom_text(
+    aes(label = signif(padj, 2)),
+    hjust = 1,
+    nudge_x = -.001,
+    color = "white"
+  ) +
+  scale_fill_manual(
+    values = c(`TRUE` = "#c62a2a", `FALSE` = "#6d6868"),
+    guide = "none"
+  ) +
+  labs(
+    x = "log2 fold-change TDP-43 (+) vs (-)",
+    y = NULL
+  )
+
+
+p
+```
+
+
+```{r}
+p <- ggplot(
+  repeat_norm_counts_family_agg,
+  aes(
+    tdp_43_status,
+    count,
+    color = patient_sample_id
+  )
+) +
+  geom_line(
+    aes(group = patient_sample_id)
+  ) +
+  geom_quasirandom(width = .1) +
+  scale_color_manual(
+    values = patient_id_color_mapping,
+    guide = "none"
+  ) +
+  ggnewscale::new_scale_color() +
+  geom_text(
+    aes(label = signif(padj, 2), color = padj < 0.05),
+    x = -Inf, y = Inf,
+    hjust = 0, vjust = 1,
+    data = de_agg_raw_lratio,
+    inherit.aes = FALSE
+  ) +
+  scale_color_manual(
+    values = c(`TRUE` = "red", `FALSE` = "black"),
+    guide = "none"
+  ) +
+  scale_y_log10(
+    expand = expansion(mult = c(.1, .2))
+  ) +
+  ggh4x::facet_wrap2(~class_family, scales = "free_y", axes = "y") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  coord_cartesian(
+    clip = "off"
+  ) +
+  labs(
+    x = NULL,
+    y = "Aggregated count",
+    title = "Read count on entire repeat body"
+  )
+p
+
+ggsave(
+  file.path("dsrna", "plots", "repeat_count_by_patient.pdf"),
+  p, width = 6, height = 5
+)
+```
+
+
+```{r}
+repeat_norm_counts_family_agg_scaled <- repeat_norm_counts_family_agg %>%
+  group_by(
+    class_family
+  ) %>%
+  mutate(
+    count_scaled = scale(count)[, 1]
+  ) %>%
+  ungroup()
+
+p <- repeat_norm_counts_family_agg_scaled %>%
+  ggplot(
+    aes(
+      class_family,
+      count_scaled,
+      color = patient_sample_id
+    )
+  ) +
+  geom_line(
+    aes(group = patient_sample_id)
+  ) +
+  geom_point() +
+  facet_wrap(
+    vars(tdp_43_status)
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    x = NULL,
+    y = "Scaled count",
+    color = "Patient"
+  )
+
+p
+ggsave(
+  file.path("dsrna", "plots", "repeat_count_scaled_by_patient.pdf"),
+  p, width = 7, height = 4
+)
+
+
+p <- repeat_norm_counts_family_agg_scaled %>%
+  ggplot(
+    aes(
+      class_family,
+      count_scaled,
+      color = patient_sample_id,
+      linestyle = tdp_43_status
+    )
+  ) +
+  geom_line(
+  ) +
+  geom_point() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    x = NULL,
+    y = "Scaled count",
+    color = "Patient"
+  )
+p
+```
+
 
 ```{r}
 p <- de_agg %>%
@@ -926,16 +1028,11 @@ res_tdp43_family <- res_tdp43 %>%
 
 ```{r}
 p <- res_tdp43_family %>%
-  filter(
-    class_family != ".",
-    !str_ends(class_family, fixed("?"))
+  semi_join(
+    repeat_whitelist,
+    by = "class_family"
   ) %>%
   arrange(desc(pvalue)) %>%
-  group_by(
-    class_family
-  ) %>%
-  filter(n() > 100) %>%
-  ungroup() %>%
   ggplot(
     aes(
       log2FoldChange,
@@ -951,15 +1048,15 @@ p <- res_tdp43_family %>%
     values = c(`TRUE` = "red", `FALSE` = "black")
   ) +
   coord_cartesian(
-    xlim = c(-10, 5)
+    xlim = c(-6, 5)
   ) +
   facet_wrap(
     vars(class_family)
   )
 
 ggsave(
-  file.path("dsrna", "plots", "repeat_deseq_tdp43_volcano_by_family.pdf"),
-  p, width = 10, height = 8
+  file.path("dsrna", "plots", "repeat_deseq_tdp43_volcano_by_family_selectd.pdf"),
+  p, width = 7, height = 5
 )
 ```
 
@@ -1158,13 +1255,13 @@ sprint_all_agg_normalized <- sprint_all_agg %>%
   )
 
 editing_index_df <- repeat_norm_counts_family_agg %>%
-  filter(
-    class_family != ".",
-    !str_ends(class_family, fixed("?"))
+  semi_join(
+    repeat_whitelist,
+    by = "class_family"
   ) %>%
   power_inner_join(
-    sprint_all_agg_normalized,
-    by = c("sample_id", "class_family"),
+    abs_test_data,
+    by = c("sample_id", "class_family", "patient_sample_id", "tdp_43_status"),
     check = check_specs(
       unmatched_keys_left = "warn",
       unmatched_keys_right = "warn",
@@ -1172,92 +1269,32 @@ editing_index_df <- repeat_norm_counts_family_agg %>%
       duplicate_keys_left = "warn"
     )
   ) %>%
-  power_inner_join(
-    liu_meta %>%
-      select(Run, patient_sample_id, tdp_43_status),
-    by = c("sample_id" = "Run"),
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      unmatched_keys_right = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) %>%
   mutate(
-    editing_index = nedited_normalized / count
+    editing_index = 1000 * nedited_adjusted / count
   )
 ```
 
 
 ```{r}
-p <- editing_index_df %>%
-  ggplot(
-    aes(
-      tdp_43_status,
-      editing_index
-    )
-  ) +
-  geom_line(
-    aes(group = patient_sample_id),
-    color = "black"
-  ) +
-  geom_quasirandom(width = .3) +
-  # geom_text(
-  #   aes(label = signif(padj, 2), color = padj < 0.05),
-  #   x = -Inf, y = Inf,
-  #   hjust = 0, vjust = 1,
-  #   data = filter(
-  #       abs_test_paired_res,
-  #       type == cur_type,
-  #       trans == "log10"
-  #     )
-  # ) +
-  # scale_color_manual(values = c(`TRUE` = "red", `FALSE` = "black")) +
-  scale_y_log10() +
-  ggh4x::facet_wrap2(~class_family, scales = "free_y", axes = "y") +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
-  # labs(
-  #   x = NULL,
-  #   y = count_type_human_readable[cur_type],
-  #   title = count_type_human_readable[cur_type]
-  # )
-
-p
-```
-
-
-```{r}
-repeat_norm_counts_avg_across_samples  <- repeat_norm_counts_family_agg %>%
-  group_by(
-    class_family
-  ) %>%
-  summarize(
-    count = mean(count),
-    .groups = "drop"
-  )
-
 editing_index_paired_difference <- editing_index_df %>%
   transmute(
     class_family,
     patient_sample_id,
     tdp_43_status,
-    editing_index = editing_index * 1000
+    count,
+    nedited_adjusted,
+    editing_index = editing_index
   ) %>%
   pivot_wider(
     names_from = tdp_43_status,
-    values_from = editing_index
+    values_from = c(editing_index, count, nedited_adjusted)
   ) %>%
   mutate(
-    difference = `TDP-43 negative` - `TDP-43 positive`
+    difference = `count_TDP-43 negative` - `count_TDP-43 positive`,
+    log_diff = log2(`count_TDP-43 negative` / `count_TDP-43 positive`)
   )
 
-editing_index_paired_raw <- editing_index_paired_difference %>%
-  semi_join(
-    repeat_norm_counts_avg_across_samples %>%
-      filter(count > 1e5),
-    by = "class_family"
-  ) %>%
+editing_index_paired_res <- editing_index_paired_difference %>%
   drop_na(difference) %>%
   group_by(
     class_family
@@ -1268,16 +1305,72 @@ editing_index_paired_raw <- editing_index_paired_difference %>%
   summarize(
     res = list(
       possibly(lm)(
-        difference ~ 1,
+        log_diff ~ 1,
         data = pick(everything())
       ) %>%
         broom::tidy()
     ),
     .groups = "drop"
+  ) %>%
+  unnest(res) %>%
+  mutate(
+    padj = p.adjust(p.value, method = "BH")
   )
 
-editing_index_paired_res <- editing_index_paired_raw %>%
+library(lme4)
+editing_index_paired_glmer_res <- editing_index_df %>%
+  mutate(
+    across(c(count, nedited_adjusted), round)
+  ) %>%
+  group_by(
+    class_family
+  ) %>%
+  summarize(
+    res = list(
+      possibly(glmer)(
+        cbind(nedited_adjusted, count) ~ tdp_43_status + (1 | patient_sample_id),
+        data = pick(everything()),
+        family = binomial
+      ) %>%
+        broom::tidy()
+    ),
+    .groups = "drop"
+  ) %>%
   unnest(res) %>%
+  filter(term == "tdp_43_statusTDP-43 positive") %>%
+  mutate(
+    padj = p.adjust(p.value, method = "BH")
+  )
+
+
+library(glmmTMB)
+editing_index_paired_nb_raw <- editing_index_df %>%
+  # mutate(
+  #   across(c(count, nedited_adjusted), round)
+  # ) %>%
+  mutate(
+    tdp_43_status = factor(tdp_43_status, levels = c("TDP-43 positive", "TDP-43 negative"))
+  ) %>%
+  group_by(
+    class_family
+  ) %>%
+  summarize(
+    res = list(
+      possibly(glmmTMB)(
+        nedited ~ tdp_43_status + offset(log(raw_count / size_factor)) + (1 | patient_sample_id),
+        data = pick(everything()),
+        family = nbinom2
+      )
+    ),
+    .groups = "drop"
+  )
+
+editing_index_paired_nb_res <- editing_index_paired_nb_raw %>%
+  mutate(
+    res = map(res, tidy)
+  ) %>%
+  unnest(res) %>%
+  filter(term == "tdp_43_statusTDP-43 negative") %>%
   mutate(
     padj = p.adjust(p.value, method = "BH")
   )
@@ -1286,45 +1379,118 @@ editing_index_paired_res <- editing_index_paired_raw %>%
 
 ```{r}
 p <- editing_index_df %>%
-  semi_join(
-    editing_index_paired_res,
-    by = "class_family"
-  ) %>%
   ggplot(
     aes(
       tdp_43_status,
-      editing_index
+      editing_index,
+      color = patient_sample_id
     )
   ) +
   geom_line(
-    aes(group = patient_sample_id),
-    color = "black"
+    aes(group = patient_sample_id)
   ) +
-  geom_quasirandom(width = .3) +
+  geom_quasirandom(width = .1) +
+  scale_color_manual(
+    values = patient_id_color_mapping,
+    guide = "none"
+  ) +
+  ggnewscale::new_scale_color() +
   geom_text(
     aes(label = signif(padj, 2), color = padj < 0.05),
     x = -Inf, y = Inf,
     hjust = 0, vjust = 1,
-    data = filter(
-        editing_index_paired_res
-      )
+    data = editing_index_paired_nb_res,
+    inherit.aes = FALSE
   ) +
   scale_color_manual(values = c(`TRUE` = "red", `FALSE` = "black"), guide = "none") +
-  scale_y_log10() +
+  scale_y_log10(
+    expand = expansion(mult = c(.1, .2))
+  ) +
   ggh4x::facet_wrap2(~class_family, scales = "free_y", axes = "y") +
   theme(
     axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    x = NULL,
+    y = "Editing index"
   )
-  # labs(
-  #   x = NULL,
-  #   y = count_type_human_readable[cur_type],
-  #   title = count_type_human_readable[cur_type]
-  # )
-
-p
 
 ggsave(
-  file.path("dsrna", "plots", "sprint_analysis", "editing_index_paired.pdf"),
-  p, width = 8, height = 8
+  file.path("dsrna", "plots", "sprint_analysis", "editing_index_paired_nb.pdf"),
+  p, width = 6, height = 5
+)
+```
+
+
+### Scatter plot editing index difference vs count difference
+
+
+```{r}
+editing_index_vs_count_diff <- power_inner_join(
+  de_agg_raw_lratio,
+  editing_index_paired_nb_res,
+  by = "class_family",
+  check = check_specs(
+    unmatched_keys_left = "warn",
+    unmatched_keys_right = "warn",
+    duplicate_keys_right = "warn",
+    duplicate_keys_left = "warn"
+  ),
+  suffix = c("_de", "_ei")
+)
+
+editing_index_vs_count_diff_long <- bind_rows(
+  `Total count` = de_agg_raw_lratio,
+  `Editing index` = editing_index_paired_nb_res,
+  .id = "type"
+) %>%
+  mutate(
+    padj_bins = cut(
+      padj,
+      breaks = c(0, .01, .05, 1),
+      labels = c("<0.01", "<0.05", ">=0.05")
+    )
+  )
+
+editing_index_vs_count_diff_dot_plot <- ggplot(
+  editing_index_vs_count_diff_long,
+  aes(
+    x = type,
+    y = class_family
+  )
+) +
+  geom_point(
+    aes(
+      color = estimate,
+      size = padj_bins
+    ),
+    shape = 15
+  ) +
+  scale_size_manual(
+    values = c("<0.01" = 8, "<0.05" = 4, ">=0.05" = 2)
+  ) +
+  scale_color_distiller(
+    palette = "RdBu",
+    limits = c(-.5, .5),
+    oob = scales::squish
+  ) +
+  scale_x_discrete(
+    position = "top",
+    # expand = expansion(mult = c(.15, .15))
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    color = "log2\nfold-change",
+    size = "Adjusted\np-value"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0, vjust = 0)
+  )
+editing_index_vs_count_diff_dot_plot
+
+ggsave(
+  file.path("dsrna", "plots", "sprint_analysis", "editing_index_vs_count_diff_dot_plot.pdf"),
+  editing_index_vs_count_diff_dot_plot, width = 3, height = 4
 )
 ```

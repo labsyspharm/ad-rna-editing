@@ -589,7 +589,7 @@ ps <- dsrip_re_cor_data %>%
     p = map2(
       data, cor_data,
       \(x, y) {
-        lfc_range <- quantile(x$log2FoldChange, probs = c(.05, .95))
+        lfc_range <- quantile(x$log2FoldChange, probs = c(.01, .99))
         d <- mutate(
           x,
           across(
@@ -680,7 +680,7 @@ pwalk(
   \(p, contrast, ...) {
     message(contrast)
     ggsave(
-      here("dsrna", "plots", paste0("dsrip_re_enrichment_density_quantiles_", str_replace(contrast, "[^\\w]+", "_"), ".pdf")),
+      here("dsrna", "plots", paste0("dsrip_re_enrichment_density_quantiles_", str_replace(contrast, "[^\\w]+", "_"), "2.pdf")),
       p +
         labs(title = contrast),
       width = 18,

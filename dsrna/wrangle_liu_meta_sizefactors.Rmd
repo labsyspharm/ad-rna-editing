@@ -1,0 +1,108 @@
+```{r setup, include=FALSE}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(powerjoin)
+library(qs)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+https://support.bioconductor.org/p/130564/#130568
+
+```{r}
+liu_salmon <- syn("syn64756732") %>%
+  qread()
+
+liu_meta_raw <- syn("syn36639762") %>%
+  read_csv() %>%
+  slice(
+    match(
+      colnames(liu_salmon$abundance),
+      Run
+    )
+  )
+```
+
+Figure out paired sample info
+
+```{r}
+library(rentrez)
+library(xml2)
+sra_search <- entrez_search(db = "sra", term = "PRJNA522295")
+sra_runinfo <- entrez_fetch(db = "sra", id = sra_search$ids, rettype = "xml") %>%
+  read_xml()
+
+sra_meta <- map(
+  set_names(c("accession", "sample_name", "sample_title")),
+  \(x) xml_attr(
+    xml_find_all(sra_runinfo, "//Member"),
+    x
+  )
+) %>%
+  as_tibble() %>%
+  distinct() %>%
+  mutate(
+    patient_sample_id = str_extract(sample_title, "S\\d+"),
+    tdp_43_status = str_extract(sample_title, "/(TDP-43 (?:negative|positive)) ", group = 1)
+  )
+
+liu_meta <- liu_meta_raw %>%
+  power_inner_join(
+    sra_meta,
+    by = c("Sample Name" = "sample_name"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      duplicate_keys_left = "warn"
+    )
+  )
+
+
+```
+
+
+```{r}
+liu_de <- DESeq2::DESeqDataSetFromTximport(
+  liu_salmon,
+  liu_meta,
+  design = ~ 1
+) %>%
+  DESeq2::estimateSizeFactors()
+
+liu_size_factors <- liu_de %>%
+  DESeq2::normalizationFactors() %>%
+  apply(2, \(x) exp(mean(log(x))))
+
+liu_meta_sf <- liu_meta %>%
+  power_inner_join(
+    enframe(
+      liu_size_factors,
+      name = "Run",
+      value = "size_factor"
+    ),
+    by = "Run",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      duplicate_keys_left = "warn",
+      unmatched_keys_right = "warn"
+    )
+  )
+
+write_csv(
+  liu_meta_sf,
+  here("dsrna", "data", "liu_sample_meta.csv")
+)
+```
+
+
+```{r}
+synStoreMany(
+  here("dsrna", "data", "liu_sample_meta.csv"),
+  parentId = "syn36639637",
+  forceVersion = FALSE
+)
+
+```
