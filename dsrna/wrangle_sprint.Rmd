@@ -171,9 +171,9 @@ sprint_repeat_overlaps <- sprint_unique_sites %>%
   ) %>%
   power_left_join(
     repeatmasker_raw %>%
-      mutate(repeat_id = row_number()) %>%
-      select(
-        repeat_id,
+      transmute(
+        repeat_id = row_number(),
+        gene_id = paste(rep_name, row_number(), sep = "_"),
         rep_name, class_family,
         repeat_start = start, repeat_end = end,
         repeat_strand = strand

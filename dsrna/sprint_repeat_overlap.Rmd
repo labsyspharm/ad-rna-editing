@@ -1566,6 +1566,15 @@ upregulated_tes <- res_tdp43_family %>%
     padj < .05
   )
 
+n_up_control_tes <- res_tdp43_family %>%
+  mutate(
+    upregulated = if_else(
+      log2FoldChange < 0 & padj < .05,
+      "Upregulated", "Control"
+    ) %>%
+      replace_na("Control")
+  ) %>%
+  dplyr::count(class_family,upregulated)
 
 repeat_norm_counts_family_agg_by_de <- repeat_norm_counts_family %>%
   semi_join(
@@ -1610,8 +1619,8 @@ sprint_all_agg_de <- sprint_all %>%
   ) %>%
   power_left_join(
     upregulated_tes %>%
-      transmute(chromosome, start, end, upregulated = TRUE),
-    by = c("chrom" = "chromosome", "repeat_start" = "start", "repeat_end" = "end"),
+      transmute(gene_id, upregulated = TRUE),
+    by = c("gene_id"),
     check = check_specs(
       unmatched_keys_right = "warn",
       duplicate_keys_right = "warn"
@@ -1693,6 +1702,202 @@ editing_index_de_df <- repeat_norm_counts_family_agg_by_de %>%
     editing_index = 1000 * nedited_adjusted / count
   )
 
+
+
+library(glmmTMB)
+editing_index_de_paired_nb_raw <- editing_index_de_df %>%
+  # mutate(
+  #   across(c(count, nedited_adjusted), round)
+  # ) %>%
+  mutate(
+    tdp_43_status = factor(tdp_43_status, levels = c("TDP-43 positive", "TDP-43 negative"))
+  ) %>%
+  group_by(
+    class_family, upregulated
+  ) %>%
+  summarize(
+    res = list(
+      possibly(glmmTMB)(
+        nedited ~ tdp_43_status + offset(log(raw_count / size_factor)) + (1 | patient_sample_id),
+        data = pick(everything()),
+        family = nbinom2
+      )
+    ),
+    .groups = "drop"
+  )
+
+editing_index_de_paired_nb_res <- editing_index_de_paired_nb_raw %>%
+  mutate(
+    res = map(res, broom::tidy)
+  ) %>%
+  unnest(res) %>%
+  filter(term == "tdp_43_statusTDP-43 negative") %>%
+  mutate(
+    padj = p.adjust(p.value, method = "BH")
+  )
+
+
+editing_index_de_by_upregulated_raw <- editing_index_de_df %>%
+  # mutate(
+  #   across(c(count, nedited_adjusted), round)
+  # ) %>%
+  mutate(
+    tdp_43_status = factor(tdp_43_status, levels = c("TDP-43 positive", "TDP-43 negative"))
+  ) %>%
+  group_by(
+    class_family, tdp_43_status
+  ) %>%
+  summarize(
+    res = list(
+      possibly(glmmTMB)(
+        nedited ~ upregulated + offset(log(raw_count / size_factor)) + (1 | patient_sample_id),
+        data = pick(everything()),
+        family = nbinom2
+      )
+    ),
+    .groups = "drop"
+  )
+
+editing_index_de_by_upregulated_res <- editing_index_de_by_upregulated_raw %>%
+  mutate(
+    res = map(res, broom::tidy)
+  ) %>%
+  unnest(res) %>%
+  filter(term == "upregulatedTRUE") %>%
+  mutate(
+    padj = p.adjust(p.value, method = "BH")
+  )
+
+
+library(glmmTMB)
+editing_index_de_combined_nb_raw <- editing_index_de_df %>%
+  # mutate(
+  #   across(c(count, nedited_adjusted), round)
+  # ) %>%
+  mutate(
+    tdp_43_status = factor(tdp_43_status, levels = c("TDP-43 positive", "TDP-43 negative"))
+  ) %>%
+  group_by(
+    class_family
+  ) %>%
+  summarize(
+    res = list(
+      possibly(glmmTMB)(
+        nedited ~ tdp_43_status*upregulated + offset(log(raw_count / size_factor)) + (1 | patient_sample_id),
+        data = pick(everything()),
+        family = nbinom2
+      )
+    ),
+    .groups = "drop"
+  )
+
+editing_index_de_combined_nb_res <- editing_index_de_combined_nb_raw %>%
+  mutate(
+    res = map(res, broom::tidy)
+  ) %>%
+  unnest(res) %>%
+  filter(!str_detect(term, "Intercept")) %>%
+  mutate(
+    padj = p.adjust(p.value, method = "BH")
+  )
+
+```
+
+### Plotting editing index for upregulated TEs
+
+```{r}
+library(glue)
+library(ggtext)
+
+ps <- editing_index_de_df %>%
+  mutate(
+    upregulated = if_else(upregulated, "Upregulated", "Control") %>%
+      factor(levels = c("Control", "Upregulated")),
+    tdp_43_status = recode(
+      tdp_43_status,
+      `TDP-43 positive` = "Control",
+      `TDP-43 negative` = "TDP-43 pathology"
+    ) %>%
+      factor(levels = c("Control", "TDP-43 pathology"))
+  ) %>%
+  group_nest(class_family) %>%
+  mutate(
+    p = map2(
+      data, class_family,
+      \(x, y) {
+        test_res <- editing_index_de_combined_nb_res %>%
+          filter(class_family == y)
+        test_res_text <- glue_data(
+          test_res,
+          "<b>{term}</b><br>p = {signif(padj, 2)}, log2FC = {signif(estimate, 2)}"
+        ) %>%
+          paste(collapse = "<br>")
+        n_tes <- n_up_control_tes %>%
+          filter(class_family == y)
+        n_tes_text <- glue_data(
+          n_tes,
+          "<b>{upregulated}</b> n = {n}"
+        ) %>%
+          paste(collapse = "<br>")
+        ggplot(
+          x,
+          aes(
+            x = upregulated,
+            y = editing_index,
+            fill = upregulated
+          )
+        ) +
+          geom_boxplot(outlier.shape = NA) +
+          geom_point(alpha = .8, size = 3, color = "black") +
+          geom_line(aes(group = patient_sample_id), alpha = .3) +
+          scale_fill_manual(
+            values = c("Control" = "#6d6868", "Upregulated" = "#c62a2a"),
+            guide = "none"
+          ) +
+          geom_richtext(
+            aes(
+              label = text
+            ),
+            data = tibble(tdp_43_status = "Control", text = test_res_text),
+            x = -Inf, y = Inf,
+            hjust = 0, vjust = 1,
+            inherit.aes = FALSE,
+            size = 2
+          ) +
+          geom_richtext(
+            aes(
+              label = text
+            ),
+            data = tibble(tdp_43_status = "TDP-43 pathology", text = n_tes_text),
+            x = -Inf, y = Inf,
+            hjust = 0, vjust = 1,
+            inherit.aes = FALSE,
+            size = 2
+          ) +
+          scale_y_continuous(
+            expand = expansion(mult = c(0, .2))
+          ) +
+          facet_wrap(vars(tdp_43_status)) +
+          labs(
+            title = y,
+            x = NULL,
+            y = "Edit rate\n(edits per 1000bp of reads)"
+          ) +
+          theme_bw()
+      }
+    )
+  )
+
+p_combined <- patchwork::wrap_plots(
+  ps$p,
+  nrow = 3,
+  axis_titles = "collect"
+)
+p_combined
+ggsave(
+  here("dsrna", "plots", "sprint_analysis", "editing_index_de_tes_by_family.pdf"),
+  p_combined, width = 12, height = 8
+)
 ```
 
 
