@@ -43,26 +43,33 @@ Exclude
 * Jockey (insects, ancient, misclassified)
 
 ```{r}
-repeat_whitelist <- rm_raw %>%
-  distinct(class_family) %>%
-  filter(
-    !str_detect(class_family, coll("?")),
-    !str_detect(class_family, coll("Jockey")),
-    !str_detect(class_family, coll("Tx1")),
-    !str_detect(class_family, coll("Dong")),
-    !str_detect(class_family, coll("Penelope")),
-    !str_detect(class_family, coll("5S-Deu-L2")),
-    !str_detect(class_family, coll("tRNA-Deu")),
-    !str_detect(class_family, coll("tRNA-RTE")),
-    !str_detect(class_family, coll("RTE-BovB")),
-    !str_detect(class_family, coll("Gypsy")),
-    !str_detect(class_family, coll("RTE-X")),
-    !str_detect(class_family, coll("CR1")),
-    str_starts(class_family, coll("LTR")) |
-      str_starts(class_family, coll("SINE")) |
-      str_starts(class_family, coll("LINE"))
-  )
+# repeat_whitelist <- rm_raw %>%
+#   distinct(class_family) %>%
+#   filter(
+#     !str_detect(class_family, coll("?")),
+#     !str_detect(class_family, coll("Jockey")),
+#     !str_detect(class_family, coll("Tx1")),
+#     !str_detect(class_family, coll("Dong")),
+#     !str_detect(class_family, coll("Penelope")),
+#     !str_detect(class_family, coll("5S-Deu-L2")),
+#     !str_detect(class_family, coll("tRNA-Deu")),
+#     !str_detect(class_family, coll("tRNA-RTE")),
+#     !str_detect(class_family, coll("RTE-BovB")),
+#     !str_detect(class_family, coll("Gypsy")),
+#     !str_detect(class_family, coll("RTE-X")),
+#     !str_detect(class_family, coll("CR1")),
+#     str_starts(class_family, coll("LTR")) |
+#       str_starts(class_family, coll("SINE")) |
+#       str_starts(class_family, coll("LINE"))
+#   )
 
+repeat_whitelist <- tibble(
+  class_family = c(
+    "LINE/L1", "LINE/L2", "LTR", "LTR/ERV1", "LTR/ERVK", "LTR/ERVL",
+    "LTR/ERVL-MaLR", "Retroposon/SVA", "SINE/Alu", "SINE/MIR",
+    "SINE/tRNA"
+  )
+)
 ```
 
 ```{r}
@@ -188,7 +195,8 @@ count_type_human_readable <- c(
   nedited_adjusted = "Edited reads",
   unedited_adjusted = "Unedited reads",
   total_adjusted = "Total reads",
-  supporting_reads_adjusted = "Score adjusted"
+  supporting_reads_adjusted = "Score adjusted",
+  editing_index = "Editing rate\n(edits / 1000 bp of transcript)"
 )
 ```
 
@@ -641,11 +649,24 @@ prop_test_family <- sprint_all %>%
 ```{r}
 library(DESeq2)
 
+rm_whitelisted <- rm_raw %>%
+  mutate(
+    gene_id = paste(rep_name, row_number(), sep = "_")
+  ) %>%
+  power_inner_join(
+    repeat_whitelist,
+    by = "class_family",
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
 repeat_counts_mat <- liu_repeat_counts[["counts"]] %>%
   magrittr::set_colnames(
     str_remove(colnames(.), fixed(".sorted.bam"))
   ) %>% {
-    .[, liu_meta$Run]
+    .[rm_whitelisted$gene_id, liu_meta$Run]
   }
 
 de_meta <- liu_meta %>%
@@ -658,7 +679,7 @@ de <- DESeqDataSetFromMatrix(
   de_meta,
   design = ~ tdp_43_status + patient_sample_id
 )
-sizeFactors(de) <- liu_size_factors
+sizeFactors(de) <- liu_meta$size_factor
 des <- DESeq(de)
 
 qsave(
@@ -667,6 +688,7 @@ qsave(
 )
 des <- qread(file.path("dsrna", "data", "liu_repeat_de.qs"))
 ```
+
 
 ```{r}
 repeat_all_counts <- list(
@@ -939,28 +961,6 @@ p
 
 
 ```{r}
-p <- de_agg %>%
-  pivot_longer(
-    c(`TDP-43 negative`, `TDP-43 positive`),
-    names_to = "tdp_43_status",
-    values_to = "count"
-  ) %>%
-  ggplot(
-    aes(
-      x = tdp_43_status,
-      y = count,
-      color = patient_sample_id
-    )
-  ) +
-  geom_line(aes(group = patient_sample_id)) +
-  geom_quasirandom() +
-  ggh4x::facet_wrap2(~class_family, scales = "free_y", axes = "y")
-
-p
-```
-
-
-```{r}
 extract_deseq_result <- function(de, contrast, name) {
   if (missing(contrast)) {
     res <- results(de, name = name)
@@ -1023,6 +1023,12 @@ res_tdp43_family <- res_tdp43 %>%
       duplicate_keys_right = "warn"
     )
   )
+
+write_csv(
+  res_tdp43_family,
+  file.path("dsrna", "data", "repeat_tdp43_pos_vs_neg_deseq.csv.gz")
+)
+# res_tdp43_family <- read_csv(file.path("dsrna", "data", "repeat_tdp43_pos_vs_neg_deseq.csv.gz"))
 ```
 
 
@@ -1234,11 +1240,8 @@ res_tdp43_family_ttest <- res_tdp43_family %>%
 ```{r}
 sprint_all_agg_normalized <- sprint_all_agg %>%
   power_inner_join(
-    enframe(
-      liu_size_factors,
-      name = "sample_id",
-      value = "size_factor"
-    ),
+    liu_meta %>%
+      select(sample_id = Run, size_factor),
     by = "sample_id",
     check = check_specs(
       unmatched_keys_left = "warn",
@@ -1272,6 +1275,11 @@ editing_index_df <- repeat_norm_counts_family_agg %>%
   mutate(
     editing_index = 1000 * nedited_adjusted / count
   )
+
+write_csv(
+  editing_index_df,
+  here("dsrna", "data", "editing_index.csv.gz")
+)
 ```
 
 
@@ -1492,5 +1500,207 @@ editing_index_vs_count_diff_dot_plot
 ggsave(
   file.path("dsrna", "plots", "sprint_analysis", "editing_index_vs_count_diff_dot_plot.pdf"),
   editing_index_vs_count_diff_dot_plot, width = 3, height = 4
+)
+```
+
+
+Per patient editing index vs absolute difference
+
+
+```{r}
+per_sample_editing_vs_absolute <- power_inner_join(
+  repeat_norm_counts_family_agg_long,
+  editing_index_df %>%
+    select(
+      patient_sample_id, class_family, tdp_43_status, editing_index
+    ) %>%
+    pivot_wider(
+      names_from = tdp_43_status,
+      values_from = editing_index
+    ) %>%
+    mutate(
+      difference = `TDP-43 negative` - `TDP-43 positive`,
+      lratio = log2(`TDP-43 negative` / `TDP-43 positive`)
+    ),
+  by = c("patient_sample_id", "class_family"),
+  suffix = c("_count", "_ei"),
+  check = check_specs(
+    unmatched_keys_left = "warn",
+    unmatched_keys_right = "warn",
+    duplicate_keys_right = "warn",
+    duplicate_keys_left = "warn"
+  )
+)
+
+p <- ggplot(
+  per_sample_editing_vs_absolute %>%
+    filter(
+      class_family != "SINE/tRNA"
+    ),
+  aes(
+    x = lratio_count,
+    y = difference_ei,
+    color = patient_sample_id
+  )
+) +
+  geom_point() +
+  scale_color_manual(
+    values = patient_id_color_mapping,
+    guide = "none"
+  ) +
+  ggh4x::facet_wrap2(
+    vars(class_family),
+    scales = "free",
+    axes = "all"
+  )
+p
+```
+
+
+## Compute editing index separately for differentially expressed TEs
+
+```{r}
+upregulated_tes <- res_tdp43_family %>%
+  filter(
+    log2FoldChange < 0,
+    padj < .05
+  )
+
+
+repeat_norm_counts_family_agg_by_de <- repeat_norm_counts_family %>%
+  semi_join(
+    repeat_whitelist,
+    by = "class_family"
+  ) %>%
+  power_left_join(
+    upregulated_tes %>%
+      transmute(gene_id, upregulated = TRUE),
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(across(upregulated, \(x) replace_na(x, FALSE))) %>%
+  group_by(
+    sample_id, class_family, upregulated
+  ) %>%
+  summarize(
+    count = sum(count),
+    raw_count = sum(raw_count),
+    .groups = "drop"
+  ) %>%
+  power_inner_join(
+    liu_meta %>%
+      select(Run, patient_sample_id, tdp_43_status),
+    by = c("sample_id" = "Run"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+
+
+sprint_all_agg_de <- sprint_all %>%
+  semi_join(
+    repeat_whitelist,
+    by = "class_family"
+  ) %>%
+  power_left_join(
+    upregulated_tes %>%
+      transmute(chromosome, start, end, upregulated = TRUE),
+    by = c("chrom" = "chromosome", "repeat_start" = "start", "repeat_end" = "end"),
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(across(upregulated, \(x) replace_na(x, FALSE))) %>%
+  filter(
+    type %in% c("AG", "TC"),
+  ) %>%
+  dplyr::rename(
+    nedited = ad,
+    total = dp,
+    sample_id = run_id
+  ) %>%
+  group_by(
+    class_family, sample_id, upregulated
+  ) %>%
+  summarise(
+    supporting_reads = sum(supporting_reads),
+    nedited = sum(nedited),
+    total = sum(total),
+    .groups = "drop"
+  )
+
+sprint_all_agg_de_norm <- sprint_all_agg_de %>%
+  semi_join(
+    repeat_whitelist,
+    by = "class_family"
+  ) %>%
+  bind_rows(
+    group_by(
+      .,
+      sample_id
+    ) %>%
+    summarise(
+      across(c(nedited, total, supporting_reads), sum),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      class_family = "all"
+    )
+  ) %>%
+  power_inner_join(
+    liu_meta %>%
+      select(Run, patient_sample_id, tdp_43_status, size_factor),
+    by = c("sample_id" = "Run"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(
+    across(
+      c(nedited, total, supporting_reads),
+      .fns = list(
+        adjusted = \(x) x / size_factor
+      )
+    )
+  )
+
+
+
+editing_index_de_df <- repeat_norm_counts_family_agg_by_de %>%
+  semi_join(
+    repeat_whitelist,
+    by = "class_family"
+  ) %>%
+  power_inner_join(
+    sprint_all_agg_de_norm,
+    by = c("sample_id", "class_family", "patient_sample_id", "tdp_43_status", "upregulated"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn",
+      duplicate_keys_left = "warn"
+    )
+  ) %>%
+  mutate(
+    editing_index = 1000 * nedited_adjusted / count
+  )
+
+```
+
+
+
+```{r}
+synStoreMany(
+  here("dsrna", "data", "repeat_tdp43_pos_vs_neg_deseq.csv.gz"),
+  parentId = "syn64829592",
+  forceVersion = FALSE
 )
 ```

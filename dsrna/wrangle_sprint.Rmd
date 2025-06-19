@@ -198,3 +198,181 @@ synStoreMany(
   forceVersion = FALSE
 )
 ```
+
+
+## BWA run
+
+
+
+```{r}
+raw_sprint <- synGlob(
+  "syn65471058", "*", "*all_*.res"
+) %>%
+  enframe("raw_name", "syn_id") %>%
+  mutate(
+    file_path = map_chr(syn_id, syn),
+    run_id = str_extract(raw_name, "SRR[0-9]+"),
+    data = map(
+      file_path,
+      \(x) read_tsv(
+        x,
+        trim_ws = TRUE,
+        skip = 1,
+        col_names = c("chrom", "start", "end", "type", "supporting_reads", "strand", "ad_dp")
+      ) %>%
+        separate_wider_delim(
+          ad_dp,
+          delim = ":",
+          names = c("ad", "dp")
+        )
+    )
+  )
+
+raw_sprint_long_bwa <- raw_sprint %>%
+  select(run_id, data) %>%
+  unnest(data) %>%
+  select(-start) %>%
+  dplyr::rename(position = end)
+
+write_csv(
+  raw_sprint_long,
+  "raw_sprint_long_bwa.csv.gz"
+)
+# raw_sprint_long <- read_csv("raw_sprint_long.csv.gz")
+```
+
+0-based exclusive to 1-based
+
+```{r}
+sprint_unique_sites_bwa <- raw_sprint_long_bwa %>%
+  distinct(
+    chrom,
+    start = position,
+    end = position
+  )
+```
+
+
+```{r}
+sprint_saf <- sprint_unique_sites_bwa %>%
+  transmute(
+    GeneID = paste("Site", row_number(), sep = "_"),
+    Chr = chrom,
+    Start = start,
+    End = end,
+    Strand = "*"
+  )
+
+fc_results <- featureCounts(
+  files = bam_files$bam_path,
+  annot.ext = sprint_saf,
+  isGTFAnnotationFile = FALSE,
+  allowMultiOverlap = TRUE,
+  isPairedEnd = TRUE,
+  nthreads = 8
+)
+
+qsave(
+  fc_results,
+  "liu_unique_sprint_counts.qs"
+)
+# fc_results <- qread("liu_unique_sprint_counts.qs")
+
+synStoreMany(
+  c(
+    "raw_sprint_long.csv.gz",
+    "liu_unique_sprint_counts.qs"
+  ),
+  parentId = "syn64376902",
+  forceVersion = FALSE
+)
+
+```
+
+```{r}
+raw_sprint_long <- syn("syn64868813") %>%
+  read_csv()
+
+liu_unique_sprint_counts <- syn("syn64868808") %>%
+  qread()
+
+repeatmasker_raw <- syn("syn55256576") %>%
+  read_csv()
+```
+
+
+```{r}
+
+# Convert to GRanges objects
+sprint_gr <- sprint_unique_sites %>%
+  GenomicRanges::makeGRangesFromDataFrame()
+
+repeatmasker_gr <- repeatmasker_raw %>%
+  transmute(
+    chromosome = str_remove(chromosome, fixed("chr")),
+    start, end,
+    strand = if_else(
+      strand == "+",
+      "+",
+      "-"
+    )
+  ) %>%
+  GenomicRanges::makeGRangesFromDataFrame()
+
+# Find overlaps
+overlaps <- GenomicRanges::findOverlaps(
+  sprint_gr, repeatmasker_gr
+) %>%
+  as_tibble()
+
+# Join with original data
+sprint_repeat_overlaps <- sprint_unique_sites %>%
+  select(-end) %>%
+  dplyr::rename(position = "start") %>%
+  mutate(
+    site_id = row_number()
+  ) %>%
+  power_left_join(
+    overlaps,
+    by = c("site_id" = "queryHits"),
+    check = check_specs(
+      unmatched_keys_right = "warn"
+    )
+  ) %>%
+  power_left_join(
+    raw_sprint_long,
+    by = c("chrom", "position"),
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  power_left_join(
+    repeatmasker_raw %>%
+      mutate(repeat_id = row_number()) %>%
+      select(
+        repeat_id,
+        rep_name, class_family,
+        repeat_start = start, repeat_end = end,
+        repeat_strand = strand
+      ),
+    by = c("subjectHits" = "repeat_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  select(
+    -c(site_id, subjectHits)
+  )
+
+write_csv(
+  sprint_repeat_overlaps,
+  here("dsrna", "data", "sprint_repeat_overlaps.csv.gz")
+)
+
+synStoreMany(
+  here("dsrna", "data", "sprint_repeat_overlaps.csv.gz"),
+  parentId = "syn64376902",
+  forceVersion = FALSE
+)
+```

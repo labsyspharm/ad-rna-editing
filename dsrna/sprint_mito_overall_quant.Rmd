@@ -98,5 +98,8 @@ sprint_mito_overlaps <- sprint_unique_sites %>%
     -c(site_id, subjectHits)
   )
 
-
+sprint_mito_overlaps %>%
+  select(
+    run_id, type, ad, dp, gene_name
+  )
 ```
