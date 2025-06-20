@@ -692,8 +692,8 @@ des <- qread(file.path("dsrna", "data", "liu_repeat_de.qs"))
 
 ```{r}
 repeat_all_counts <- list(
-  normalized = counts(des, normalized = TRUE),
-  raw = counts(des, normalized = FALSE)
+  normalized = DESeq2::counts(des, normalized = TRUE),
+  raw = DESeq2::counts(des, normalized = FALSE)
 )
 
 repeat_norm_counts_family <- repeat_all_counts %>%
@@ -1576,6 +1576,86 @@ n_up_control_tes <- res_tdp43_family %>%
   ) %>%
   dplyr::count(class_family,upregulated)
 
+editing_index_master <- power_full_join(
+  repeat_norm_counts_family %>%
+    semi_join(
+      repeat_whitelist,
+      by = "class_family"
+    ) %>%
+    select(
+      gene_id, sample_id, ends_with("count"), class_family
+    ),
+  sprint_all %>%
+    semi_join(
+      repeat_whitelist,
+      by = "class_family"
+    ) %>%
+    filter(
+      type %in% c("AG", "TC"),
+    ) %>%
+    dplyr::rename(
+      nedited = ad,
+      total = dp,
+      sample_id = run_id
+    ) %>%
+    power_inner_join(
+      liu_meta %>%
+        select(Run, patient_sample_id, tdp_43_status, size_factor),
+      by = c("sample_id" = "Run"),
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        duplicate_keys_right = "warn"
+      )
+    ) %>%
+    mutate(
+      across(
+        c(nedited, total, supporting_reads),
+        .fns = list(
+          adjusted = \(x) x / size_factor
+        )
+      )
+    ),
+  by = c("gene_id", "sample_id", "class_family"),
+  check = check_specs(
+    unmatched_keys_left = "warn",
+    unmatched_keys_right = "warn"
+  )
+)
+
+write_csv(
+  editing_index_master,
+  here("dsrna", "data", "editing_index_master.csv.gz")
+)
+
+editing_index_de_master <- editing_index_master %>%
+  power_left_join(
+    upregulated_tes %>%
+      transmute(gene_id, upregulated = TRUE),
+    by = c("gene_id"),
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(across(upregulated, \(x) replace_na(x, FALSE))) %>%
+  group_by(
+    sample_id, class_family, upregulated
+  ) %>%
+  summarize(
+    across(
+      c(
+        ends_with("count"),
+        starts_with("nedited"),
+        starts_with("total"),
+        supporting_reads
+      ),
+      \(x) sum(x, na.rm = TRUE)
+    ),
+    editing_index = 240 * nedited_adjusted / count,
+    .groups = "drop"
+  )
+
+
 repeat_norm_counts_family_agg_by_de <- repeat_norm_counts_family %>%
   semi_join(
     repeat_whitelist,
@@ -1875,7 +1955,7 @@ ps <- editing_index_de_df %>%
             size = 2
           ) +
           scale_y_continuous(
-            expand = expansion(mult = c(0, .2))
+            expand = expansion(mult = c(0.05, .2))
           ) +
           facet_wrap(vars(tdp_43_status)) +
           labs(
@@ -1900,6 +1980,83 @@ ggsave(
 )
 ```
 
+
+##
+
+
+```{r}
+repeat_norm_counts_family_binned <- repeat_norm_counts_family %>%
+  mutate(
+    count_bin = cut(
+      count,
+      breaks = exp(seq(log(min(count[count > 0])), log(max(count)), length.out = 31)),
+      include.lowest = TRUE
+    )
+  )
+
+repeat_norm_counts_family_binned_agg <- repeat_norm_counts_family_binned %>%
+  group_by(
+    class_family, count_bin
+  ) %>%
+  summarize(
+    n = n(),
+    across(c(count, raw_count), \(x) sum(x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    bin_start = as.numeric(str_extract(as.character(count_bin), "(?<=\\[|\\()[0-9.e+-]+(?=,)")),
+    bin_end = as.numeric(str_extract(as.character(count_bin), "(?<=,)[0-9.e+-]+(?=\\])"))
+  )
+
+
+p <- ggplot(
+  repeat_norm_counts_family_binned,
+  aes(
+    x = (bin_start + bin_end) / 2,
+    y = n
+  )
+) +
+  geom_col() +
+  scale_x_log10() +
+  facet_wrap(
+    vars(class_family)
+  )
+p
+
+p <- ggplot(
+  repeat_norm_counts_family_binned %>%
+    mutate(
+      bin_start = as.numeric(str_extract(as.character(count_bin), "(?<=\\[|\\()[0-9.e+-]+(?=,)")),
+      bin_end = as.numeric(str_extract(as.character(count_bin), "(?<=,)[0-9.e+-]+(?=\\])"))
+    ),
+  aes(
+    x = (bin_start + bin_end) / 2,
+    y = count
+  )
+) +
+  geom_col() +
+  scale_x_log10() +
+  facet_wrap(
+    vars(class_family)
+  )
+p
+
+p <- ggplot(
+  repeat_norm_counts_family,
+  aes(
+    x = count,
+    y = after_stat(count) * x
+  )
+) +
+  geom_histogram() +
+  scale_x_log10() +
+  facet_wrap(
+    vars(class_family)
+  )
+p
+
+
+```
 
 
 ```{r}
