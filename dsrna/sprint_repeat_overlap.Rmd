@@ -1566,26 +1566,56 @@ upregulated_tes <- res_tdp43_family %>%
     padj < .05
   )
 
-n_up_control_tes <- res_tdp43_family %>%
+res_tdp43_family_de_annotated <- res_tdp43_family %>%
   mutate(
     upregulated = if_else(
       log2FoldChange < 0 & padj < .05,
       "Upregulated", "Control"
     ) %>%
       replace_na("Control")
-  ) %>%
+  )
+
+n_up_control_tes <- res_tdp43_family_de_annotated %>%
   dplyr::count(class_family,upregulated)
 
-editing_index_master <- power_full_join(
-  repeat_norm_counts_family %>%
+compute_editing_index <- function(
+  grouping_df, grouping_keys,
+  join_keys = c("gene_id")
+) {
+  join_syms <- syms(join_keys)
+  grouping_syms <- syms(grouping_keys)
+  repeat_count_agg <- repeat_norm_counts_family %>%
     semi_join(
       repeat_whitelist,
       by = "class_family"
     ) %>%
+    power_inner_join(
+      grouping_df %>%
+        select(!!!join_syms, !!!grouping_syms),
+      by = join_keys,
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        unmatched_keys_right = "warn",
+        duplicate_keys_right = "warn"
+      )
+    ) %>%
     select(
-      gene_id, sample_id, ends_with("count"), class_family
-    ),
-  sprint_all %>%
+      gene_id, sample_id, ends_with("count"), class_family,
+      !!!grouping_syms
+    ) %>%
+    group_by(
+      sample_id, class_family, !!!grouping_syms
+    ) %>%
+    summarize(
+      across(
+        c(
+          ends_with("count")
+        ),
+        \(x) sum(x, na.rm = TRUE)
+      ),
+      .groups = "drop"
+    )
+  sprint_agg <- sprint_all %>%
     semi_join(
       repeat_whitelist,
       by = "class_family"
@@ -1600,7 +1630,7 @@ editing_index_master <- power_full_join(
     ) %>%
     power_inner_join(
       liu_meta %>%
-        select(Run, patient_sample_id, tdp_43_status, size_factor),
+        select(Run, size_factor),
       by = c("sample_id" = "Run"),
       check = check_specs(
         unmatched_keys_left = "warn",
@@ -1614,178 +1644,73 @@ editing_index_master <- power_full_join(
           adjusted = \(x) x / size_factor
         )
       )
-    ),
-  by = c("gene_id", "sample_id", "class_family"),
-  check = check_specs(
-    unmatched_keys_left = "warn",
-    unmatched_keys_right = "warn"
-  )
-)
-
-write_csv(
-  editing_index_master,
-  here("dsrna", "data", "editing_index_master.csv.gz")
-)
-
-editing_index_de_master <- editing_index_master %>%
-  power_left_join(
-    upregulated_tes %>%
-      transmute(gene_id, upregulated = TRUE),
-    by = c("gene_id"),
-    check = check_specs(
-      unmatched_keys_right = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) %>%
-  mutate(across(upregulated, \(x) replace_na(x, FALSE))) %>%
-  group_by(
-    sample_id, class_family, upregulated
-  ) %>%
-  summarize(
-    across(
-      c(
-        ends_with("count"),
-        starts_with("nedited"),
-        starts_with("total"),
-        supporting_reads
-      ),
-      \(x) sum(x, na.rm = TRUE)
-    ),
-    editing_index = 240 * nedited_adjusted / count,
-    .groups = "drop"
-  )
-
-
-repeat_norm_counts_family_agg_by_de <- repeat_norm_counts_family %>%
-  semi_join(
-    repeat_whitelist,
-    by = "class_family"
-  ) %>%
-  power_left_join(
-    upregulated_tes %>%
-      transmute(gene_id, upregulated = TRUE),
-    by = "gene_id",
-    check = check_specs(
-      unmatched_keys_right = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) %>%
-  mutate(across(upregulated, \(x) replace_na(x, FALSE))) %>%
-  group_by(
-    sample_id, class_family, upregulated
-  ) %>%
-  summarize(
-    count = sum(count),
-    raw_count = sum(raw_count),
-    .groups = "drop"
-  ) %>%
-  power_inner_join(
-    liu_meta %>%
-      select(Run, patient_sample_id, tdp_43_status),
-    by = c("sample_id" = "Run"),
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      unmatched_keys_right = "warn",
-      duplicate_keys_right = "warn"
-    )
-  )
-
-
-
-sprint_all_agg_de <- sprint_all %>%
-  semi_join(
-    repeat_whitelist,
-    by = "class_family"
-  ) %>%
-  power_left_join(
-    upregulated_tes %>%
-      transmute(gene_id, upregulated = TRUE),
-    by = c("gene_id"),
-    check = check_specs(
-      unmatched_keys_right = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) %>%
-  mutate(across(upregulated, \(x) replace_na(x, FALSE))) %>%
-  filter(
-    type %in% c("AG", "TC"),
-  ) %>%
-  dplyr::rename(
-    nedited = ad,
-    total = dp,
-    sample_id = run_id
-  ) %>%
-  group_by(
-    class_family, sample_id, upregulated
-  ) %>%
-  summarise(
-    supporting_reads = sum(supporting_reads),
-    nedited = sum(nedited),
-    total = sum(total),
-    .groups = "drop"
-  )
-
-sprint_all_agg_de_norm <- sprint_all_agg_de %>%
-  semi_join(
-    repeat_whitelist,
-    by = "class_family"
-  ) %>%
-  bind_rows(
-    group_by(
-      .,
-      sample_id
     ) %>%
-    summarise(
-      across(c(nedited, total, supporting_reads), sum),
-      .groups = "drop"
-    ) %>%
-    mutate(
-      class_family = "all"
-    )
-  ) %>%
-  power_inner_join(
-    liu_meta %>%
-      select(Run, patient_sample_id, tdp_43_status, size_factor),
-    by = c("sample_id" = "Run"),
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) %>%
-  mutate(
-    across(
-      c(nedited, total, supporting_reads),
-      .fns = list(
-        adjusted = \(x) x / size_factor
+    power_inner_join(
+      grouping_df %>%
+        select(!!!join_syms, !!!grouping_syms),
+      by = join_keys,
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        unmatched_keys_right = "warn",
+        duplicate_keys_right = "warn"
       )
+    ) %>%
+    group_by(
+      sample_id, class_family, !!!grouping_syms
+    ) %>%
+    summarize(
+      across(
+        c(
+          starts_with("nedited"),
+          starts_with("total"),
+          supporting_reads
+        ),
+        \(x) sum(x, na.rm = TRUE)
+      ),
+      .groups = "drop"
     )
-  )
-
-
-
-editing_index_de_df <- repeat_norm_counts_family_agg_by_de %>%
-  semi_join(
-    repeat_whitelist,
-    by = "class_family"
-  ) %>%
-  power_inner_join(
-    sprint_all_agg_de_norm,
-    by = c("sample_id", "class_family", "patient_sample_id", "tdp_43_status", "upregulated"),
+  power_left_join(
+    repeat_count_agg,
+    sprint_agg,
+    by = c("sample_id", "class_family", grouping_keys),
     check = check_specs(
-      unmatched_keys_left = "warn",
+      unmatched_keys_left = "info",
       unmatched_keys_right = "warn",
       duplicate_keys_right = "warn",
       duplicate_keys_left = "warn"
     )
   ) %>%
-  mutate(
-    editing_index = 1000 * nedited_adjusted / count
-  )
+    mutate(
+      across(
+        c(
+          starts_with("nedited"),
+          starts_with("total"),
+          supporting_reads
+        ),
+        \(x) replace_na(x, 0)
+      )
+    ) %>%
+    power_inner_join(
+      liu_meta %>%
+        select(Run, patient_sample_id, tdp_43_status),
+      by = c("sample_id" = "Run"),
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        duplicate_keys_right = "warn"
+      )
+    ) %>%
+    mutate(
+      editing_index = 1000 * nedited_adjusted / count
+    )
+}
 
-
+editing_index_by_te_de <- compute_editing_index(
+  res_tdp43_family_de_annotated,
+  c("upregulated")
+)
 
 library(glmmTMB)
-editing_index_de_paired_nb_raw <- editing_index_de_df %>%
+editing_index_de_paired_nb_raw <- editing_index_by_te_de %>%
   # mutate(
   #   across(c(count, nedited_adjusted), round)
   # ) %>%
@@ -2009,8 +1934,15 @@ repeat_norm_counts_family_binned_agg <- repeat_norm_counts_family_binned %>%
   )
 
 
+editing_index_by_expr_bin <- compute_editing_index(
+  repeat_norm_counts_family_binned %>%
+    drop_na(count_bin),
+  c("count_bin"), c("gene_id", "sample_id")
+)
+
+
 p <- ggplot(
-  repeat_norm_counts_family_binned,
+  repeat_norm_counts_family_binned_agg,
   aes(
     x = (bin_start + bin_end) / 2,
     y = n
@@ -2024,7 +1956,7 @@ p <- ggplot(
 p
 
 p <- ggplot(
-  repeat_norm_counts_family_binned %>%
+  repeat_norm_counts_family_binned_agg %>%
     mutate(
       bin_start = as.numeric(str_extract(as.character(count_bin), "(?<=\\[|\\()[0-9.e+-]+(?=,)")),
       bin_end = as.numeric(str_extract(as.character(count_bin), "(?<=,)[0-9.e+-]+(?=\\])"))
@@ -2042,6 +1974,32 @@ p <- ggplot(
 p
 
 p <- ggplot(
+  editing_index_by_expr_bin %>%
+    mutate(
+      bin_start = as.numeric(str_extract(as.character(count_bin), "(?<=\\[|\\()[0-9.e+-]+(?=,)")),
+      bin_end = as.numeric(str_extract(as.character(count_bin), "(?<=,)[0-9.e+-]+(?=\\])"))
+    ),
+  aes(
+    x = (bin_start + bin_end) / 2,
+    y = editing_index,
+    color = patient_sample_id,
+    shape = tdp_43_status
+  )
+) +
+  geom_quasirandom() +
+  scale_color_manual(
+    values = patient_id_color_mapping,
+    guide = "none"
+  ) +
+  scale_x_log10() +
+  facet_wrap(
+    vars(class_family),
+    scales = "free_y"
+  )
+p
+
+
+p <- ggplot(
   repeat_norm_counts_family,
   aes(
     x = count,
@@ -2056,6 +2014,65 @@ p <- ggplot(
 p
 
 
+```
+
+
+
+## Absolute levels of unedited basepairs
+
+What might be immunogenic at the end are the total humber
+of unedites dsRNA floating around, trying to quantify that.
+
+```{r}
+BP_PER_READ <- 240
+
+total_unedited <- power_inner_join(
+  repeat_norm_counts_family_agg,
+  abs_test_data,
+  by = c("sample_id", "class_family", "patient_sample_id", "tdp_43_status"),
+  check = check_specs(
+    unmatched_keys_left = "warn",
+    unmatched_keys_right = "warn",
+    duplicate_keys_right = "warn",
+    duplicate_keys_left = "warn"
+  )
+) %>%
+  mutate(
+    total_unedited = count * BP_PER_READ - nedited_adjusted
+  )
+
+p <- ggplot(
+  total_unedited,
+  aes(
+    x = tdp_43_status,
+    y = total_unedited
+  )
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    alpha = .5
+  ) +
+  geom_point(
+    aes(
+      color = patient_sample_id
+    )
+  ) +
+  geom_line(
+    aes(color = patient_sample_id, group = patient_sample_id)
+  ) +
+  scale_color_manual(
+    values = patient_id_color_mapping,
+    guide = "none"
+  ) +
+  facet_wrap(
+    vars(class_family)
+  ) +
+  labs(
+    x = NULL,
+    y = "Total unedited basepairs",
+    title = "Total unedited basepairs on entire repeat body"
+  )
+p
 ```
 
 
