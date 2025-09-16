@@ -1,0 +1,217 @@
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(powerjoin)
+library(qs)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+```{r}
+rm_raw <- syn("syn55256576") %>%
+  read_csv()
+```
+
+
+```{r}
+rm_num <- rm_raw %>%
+  mutate(
+    across(
+      c(rep_start, rep_end, rep_left),
+      .fns = list(
+        num = \(x) str_replace_all(x, "[^0-9]", "") %>%
+          as.integer()
+      )
+    )
+  )
+
+
+rm_num %>%
+  filter(rep_name == "L1MC") %>%
+  ggplot(
+    aes(
+      rep_end_num, rep_left_num, color = strand
+    )
+  ) +
+  geom_point()
+
+rm_num %>%
+  filter(rep_name == "L1MC") %>%
+  ggplot(
+    aes(
+      rep_start_num, rep_left_num, color = strand
+    )
+  ) +
+  geom_point()
+
+rm_num %>%
+  filter(rep_name == "L1MC") %>%
+  ggplot(
+    aes(
+      rep_start_num, rep_end_num, color = strand
+    )
+  ) +
+  geom_point()
+
+rm_num %>%
+  filter(rep_name == "L2a", strand == "+") %>%
+  ggplot(
+    aes(
+      rep_total_missing, rep_prop_aligned, color = strand
+    )
+  ) +
+  geom_point()
+
+rm_num %>%
+  filter(rep_name == "L2b", strand == "+") %>%
+  ggplot(
+    aes(rep_prop_aligned, perc_del)
+  ) +
+  geom_point()
+```
+
+
+
+```{r}
+rm_num %>%
+  filter(rep_name == "L1MC") %>%
+  ggplot(
+    aes(
+      rep_con_start, rep_con_end, color = strand
+    )
+  ) +
+  geom_point()
+
+rm_num %>%
+  filter(rep_name == "L1MC") %>%
+  ggplot(
+    aes(
+      rep_con_start, rep_total, color = strand
+    )
+  ) +
+  geom_point()
+
+rm_num %>%
+  filter(rep_name == "L1MC") %>%
+  ggplot(
+    aes(
+      rep_con_end, rep_total, color = strand
+    )
+  ) +
+  geom_point()
+
+rm_num %>%
+  filter(rep_name == "L1MC") %>%
+  ggplot(
+    aes(
+      rep_con_left, rep_total, color = strand
+    )
+  ) +
+  geom_point()
+
+rm_num %>%
+  filter(rep_name == "L1MC") %>%
+  ggplot(
+    aes(
+      rep_con_end, rep_con_left, color = strand
+    )
+  ) +
+  geom_point()
+
+rm_num %>%
+  filter(rep_name == "L1MC") %>%
+  ggplot(
+    aes(
+      rep_con_start, rep_con_end, color = strand
+    )
+  ) +
+  geom_point()
+
+rm_num %>%
+  filter(rep_name == "L1MC") %>%
+  ggplot(
+    aes(
+      rep_con_start, rep_con_left, color = strand
+    )
+  ) +
+  geom_point()
+```
+
+Something weird going on with `rep_left`. Different meaning in the + vs - strand?
+
+Attempt fix where all coordinates are with respect to the + strand.
+
+```{r}
+repeat_whitelist <- tibble(
+  class_family = c(
+    "LINE/L1", "LINE/L2", "LTR", "LTR/ERV1", "LTR/ERVK", "LTR/ERVL",
+    "LTR/ERVL-MaLR", "Retroposon/SVA", "SINE/Alu", "SINE/MIR",
+    "SINE/tRNA"
+  )
+)
+```
+
+
+```{r}
+rm_fixed <- rm_num %>%
+  mutate(
+    rep_total = if_else(
+      strand == "+",
+      rep_end_num + rep_left_num - 1,
+      rep_start_num + rep_end_num - 1
+    ),
+    rep_left_correct = if_else(
+      strand == "+",
+      rep_left_num,
+      rep_total - rep_end_num
+    ),
+    rep_end_correct = if_else(
+      strand == "+",
+      rep_end_num,
+      rep_total - rep_start_num
+    ),
+    rep_start_correct = if_else(
+      strand == "+",
+      rep_start_num,
+      rep_left_num
+    ),
+    rep_total_missing = rep_start_correct + rep_left_correct - 1,
+    rep_prop_aligned =  1 - (rep_total_missing / rep_total)
+  )
+
+rm_fixed %>%
+  semi_join(
+    repeat_whitelist,
+    by = "class_family"
+  ) %>%
+  ggplot(
+    aes(rep_prop_aligned, class_family)
+  ) +
+  geom_violin(
+    draw_quantiles = c(0.25, 0.5, 0.75)
+  ) +
+  labs(
+    x = "Proportion repeat aligned",
+    y = NULL
+  )
+```
+
+
+```{r}
+write_csv(
+  rm_fixed,
+  here("dsrna", "data", "repeatmasker_fixed.csv.gz")
+)
+```
+
+
+```{r}
+synStoreMany(
+  here("dsrna", "data", "repeatmasker_fixed.csv.gz"),
+  parentId = "syn55256519",
+  forceVersion = FALSE
+)
+```
