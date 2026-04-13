@@ -1,0 +1,148 @@
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(here)
+library(powerjoin)
+library(qs)
+library(emmeans)
+library(readxl)
+library(synExtra)
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+```{r}
+props_raw <- syn("syn74417245") |>
+  read_excel(skip = 1)
+
+props <- props_raw |>
+  select(-`Bg Expected %`) |>
+  pivot_longer(
+    -Feature,
+    names_to = "sample",
+    values_to = "value"
+  ) |>
+  separate_wider_regex(
+    value,
+    patterns = c(count = "[0-9,]+", "  \\(", percentage = "[0-9.]+", "\\%\\)"),
+    too_few = "debug"
+  ) |>
+  filter(
+    !str_detect(sample, "^\\s+$")
+  ) |>
+  mutate(
+    across(count, \(x) str_remove(x, fixed(",")) |> as.numeric()),
+    across(sample, \(x) str_remove(x, "\\s+N\\s+\\(%\\)") |> janitor::make_clean_names(allow_dupes = TRUE))
+  ) |>
+  bind_rows(
+    tribble(
+      ~Feature, ~sample, ~count,
+      "intronic", "overall", 1809425,
+      "5_utr", "overall", 79248,
+      "3_utr", "overall", 226602,
+      "intergenic", "overall", 1448040,
+      "exon_cds", "overall", 33214,
+      "splice_junction", "overall", 64961
+    )
+  )
+```
+
+
+```{r}
+props_with_total <- props |>
+  group_by(sample) |>
+  mutate(total = sum(count)) |>
+  ungroup() |>
+  mutate(
+    sample = fct_relevel(sample, "overall")
+  )
+
+
+mdl <- glm(
+  cbind(count, total - count) ~ Feature * sample,
+  data = props_with_total,
+  family = binomial
+)
+
+mdl_em <- emmeans(
+  mdl,
+  ~ Feature | sample,
+  type = "response"
+)
+
+mdl_em_by_sample <- emmeans(
+  mdl,
+  ~ sample | Feature,
+  type = "response"
+) |>
+  contrast(method = "trt.vs.ctrl", ref = "overall")
+
+mdl_em_by_sample_df <- mdl_em_by_sample |>
+  as_tibble() |>
+  separate_wider_delim(
+    contrast,
+    delim = " / ",
+    names = c("sample", "overall")
+  )
+
+emmeans(
+  mdl,
+  ~ sample | Feature,
+  type = "response"
+) |>
+  contrast(
+    method = "pairwise"
+  )
+```
+
+
+```{r}
+p <- ggplot(
+  mdl_em_by_sample_df,
+  aes(
+    x = Feature,
+    y = log2(odds.ratio)
+  )
+) +
+  geom_col(
+    aes(
+      fill = sample
+    ),
+    position = position_dodge(width = 0.9)
+  ) +
+  geom_text(
+    aes(
+      label = if_else(p.value < 0.05, "*", ""),
+      y = if_else(odds.ratio > 1, log2(odds.ratio) + 0.02, log2(odds.ratio) - 0.05),
+      vjust = if_else(odds.ratio > 1, 0, 1)
+    ),
+    position = position_dodge2(width = .9)
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed"
+  ) +
+  ggokabeito::scale_fill_okabe_ito() +
+  scale_x_discrete(
+    expand = expansion(mult = c(0.05, 0.05))
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.1, 0.15))
+  ) +
+  labs(
+    x = NULL,
+    y = "Log2 Odds Ratio vs\ngenomic distribution"
+  ) +
+  envalysis::theme_publish() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+p
+
+ggsave(
+  here("dsrna", "plots", "de_te_location_odds_ratio.pdf"),
+  p, width = 4, height = 3
+)
+```
