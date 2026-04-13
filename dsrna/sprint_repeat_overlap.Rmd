@@ -25,9 +25,13 @@ liu_repeat_counts <- syn("syn64829593") %>%
 rm_raw <- syn("syn55256576") %>%
   read_csv()
 
+rm_fixed <- syn("syn69841843") %>%
+  read_csv()
+
 liu_meta <- syn("syn65596451") %>%
   read_csv()
 ```
+
 
 Only include LTRs, LINEs, SINEs
 
@@ -1180,6 +1184,58 @@ plotly::ggplotly(
 
 ```
 
+### Vs proportion complete
+
+```{r}
+res_tdp43_family_vs_complete <- res_tdp43_family %>%
+  power_inner_join(
+    rm_fixed %>%
+      select(
+        chromosome, start, end, class_family,
+        rep_prop_aligned
+      ),
+    by = c("chromosome", "start", "end", "class_family"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+p <- res_tdp43_family_vs_complete %>%
+  replace_na(
+    list(padj = 1)
+  ) %>%
+  arrange(desc(padj)) %>%
+  ggplot(
+    aes(
+      log2FoldChange,
+      rep_prop_aligned,
+      color = padj < 0.05
+    )
+  ) +
+  ggrastr::rasterize(
+    geom_point(alpha = .6, shape = 16),
+    dpi = 200, dev = "ragg"
+  ) +
+  scale_color_manual(
+    values = c(`TRUE` = "red", `FALSE` = "black"),
+    na.value = "grey"
+  ) +
+  facet_wrap(
+    vars(class_family),
+    scales = "free_x"
+  ) +
+  labs(
+    x = "log2 fold-change TDP-43 pathology (+) vs (-)",
+    y = "Proportion complete"
+  )
+
+ggsave(
+  file.path("dsrna", "plots", "repeat_deseq_tdp43_vs_prop_complete_by_family.pdf"),
+  p, width = 7, height = 5
+)
+```
 
 
 ```{r}
@@ -1707,7 +1763,16 @@ compute_editing_index <- function(
 editing_index_by_te_de <- compute_editing_index(
   res_tdp43_family_de_annotated,
   c("upregulated")
-)
+) %>%
+  power_inner_join(
+    liu_meta %>%
+      select(Run, size_factor),
+    by = c("sample_id" = "Run"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
 
 library(glmmTMB)
 editing_index_de_paired_nb_raw <- editing_index_by_te_de %>%
@@ -1775,7 +1840,7 @@ editing_index_de_by_upregulated_res <- editing_index_de_by_upregulated_raw %>%
 
 
 library(glmmTMB)
-editing_index_de_combined_nb_raw <- editing_index_de_df %>%
+editing_index_de_combined_nb_raw <- editing_index_by_te_de %>%
   # mutate(
   #   across(c(count, nedited_adjusted), round)
   # ) %>%
@@ -1806,6 +1871,23 @@ editing_index_de_combined_nb_res <- editing_index_de_combined_nb_raw %>%
     padj = p.adjust(p.value, method = "BH")
   )
 
+library(emmeans)
+editing_index_de_combined_nb_emm <- editing_index_de_combined_nb_raw %>%
+  mutate(
+    emm = map(
+      res,
+      \(x) emmeans(
+        x, ~ tdp_43_status | upregulated
+      )
+    )
+  )
+
+editing_index_de_combined_nb_emm_by_tdp_43_status <- editing_index_de_combined_nb_emm %>%
+  mutate(
+    emm = map(emm, \(x) pairs(x) %>% as_tibble())
+  ) %>%
+  select(-res) %>%
+  unnest(emm)
 ```
 
 ### Plotting editing index for upregulated TEs
@@ -1906,7 +1988,83 @@ ggsave(
 ```
 
 
-##
+### Plotting only upregulated TEs
+
+
+```{r}
+
+library(glue)
+library(ggtext)
+
+editing_index_de_combined_nb_emm_by_tdp_43_status_p <- with(
+  editing_index_de_combined_nb_emm_by_tdp_43_status,
+  set_names(
+    p.value, class_family
+  )
+)
+
+ps <- editing_index_by_te_de %>%
+  mutate(
+    upregulated = factor(upregulated, levels = c("Control", "Upregulated")),
+    tdp_43_status = recode(
+      tdp_43_status,
+      `TDP-43 positive` = "Control",
+      `TDP-43 negative` = "TDP-43 pathology"
+    ) %>%
+      factor(levels = c("Control", "TDP-43 pathology")),
+    class_family_p = {
+      p <- editing_index_de_combined_nb_emm_by_tdp_43_status_p[class_family]
+      paste0(
+        class_family, "<br>",
+        "<span", if_else(p < .05, " style='color:red'", ""), ">",
+        "p = ", signif(p, 2),
+        "</span>"
+      )
+    }
+  ) %>%
+  filter(upregulated == "Upregulated") %>%
+  ggplot(
+    aes(
+      x = tdp_43_status,
+      y = editing_index,
+      fill = tdp_43_status
+    )
+  ) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(alpha = .8, size = 3, color = "black") +
+    geom_line(aes(group = patient_sample_id), alpha = .3) +
+    scale_fill_manual(
+      values = c("Control" = "#6d6868", "TDP-43 pathology" = "#c62a2a"),
+      guide = "none"
+    ) +
+    facet_wrap(
+      vars(class_family_p),
+      scales = "free_y"
+    ) +
+    labs(
+      title = "Editing index for excess TEs in TDP-43 pathology",
+      x = NULL,
+      y = "Edit rate\n(edits per 1000bp of reads)"
+    ) +
+    theme_bw() +
+    theme(
+      strip.background = element_blank(),
+      strip.text = element_textbox_simple(
+        halign = .5,
+        margin = unit(4, "pt")
+      ),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+ps
+ggsave(
+  here("dsrna", "plots", "sprint_analysis", "editing_index_de_tes_by_family_upregulated_only.pdf"),
+  ps, width = 7, height = 7
+)
+
+```
+
+
+## Editing index by expression bin
 
 
 ```{r}

@@ -182,7 +182,7 @@ rm_fixed <- rm_num %>%
     rep_prop_aligned =  1 - (rep_total_missing / rep_total)
   )
 
-rm_fixed %>%
+p <- rm_fixed %>%
   semi_join(
     repeat_whitelist,
     by = "class_family"
@@ -194,9 +194,16 @@ rm_fixed %>%
     draw_quantiles = c(0.25, 0.5, 0.75)
   ) +
   labs(
-    x = "Proportion repeat aligned",
+    x = "Proportion complete",
     y = NULL
   )
+
+ggsave(
+  here("dsrna", "plots", "repeatmasker_prop_aligned.pdf"),
+  p,
+  width = 5,
+  height = 4
+)
 ```
 
 
