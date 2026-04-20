@@ -72,6 +72,9 @@ mdl_em <- emmeans(
   type = "response"
 )
 
+mdl_em_df <- mdl_em |>
+  as_tibble()
+
 mdl_em_by_sample <- emmeans(
   mdl,
   ~ sample | Feature,
@@ -99,8 +102,18 @@ emmeans(
 
 
 ```{r}
+sample_label_map <- c(
+  "Genomic background" = "overall",
+  "AMP-AD up" = "amp_ad",
+  "Liu et al. up" = "liu_et_al",
+  "Target ALS up" = "target_als"
+)
+
 p <- ggplot(
-  mdl_em_by_sample_df,
+  mdl_em_by_sample_df |>
+    mutate(
+      sample = fct_recode(sample, !!!sample_label_map) |> fct_relevel("Genomic background")
+    ),
   aes(
     x = Feature,
     y = log2(odds.ratio)
@@ -145,4 +158,42 @@ ggsave(
   here("dsrna", "plots", "de_te_location_odds_ratio.pdf"),
   p, width = 4, height = 3
 )
+```
+
+
+```{r}
+p <- ggplot(
+  mdl_em_df |>
+    mutate(
+      sample = fct_recode(sample, !!!sample_label_map) |> fct_relevel("Genomic background")
+    ),
+  aes(
+    x = Feature,
+    y = prob
+  )
+) +
+  geom_point(
+    aes(
+      color = sample
+    ),
+    position = position_dodge(width = 0.9)
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = asymp.LCL,
+      ymax = asymp.UCL
+    ),
+    position = position_dodge2(width = 0.9)
+  ) +
+  scale_y_log10() +
+  labs(
+    x = NULL,
+    y = "TE location proportion"
+  ) +
+  envalysis::theme_publish() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+p
+
 ```
