@@ -20,9 +20,8 @@ syn <- synExtra::synDownloader(normalizePath("~/data"), .cache = TRUE)
 ## Load data
 
 ```{r}
-# te_counts_raw <- syn("syn75167623") |>
-#   qs_read()
-te_counts_raw <- qs_read("~/Downloads/amp-ad_full_PCC_repeat_counts_raw-fraction_AND_secondary_noMETA.qs2")
+te_counts_raw <- syn("syn75213136") |>
+  qs_read()
 
 rm_raw <- syn("syn55256576") |>
   read_csv() |>
@@ -36,7 +35,10 @@ rosmap_tdp43_classification <- syn("syn44277761") |>
 rosmap_meta_raw <- syn("syn66532355") |>
   read_csv()
 
-tximport_raw <- syn("syn75212072") |>
+gene_tximport_raw <- syn("syn75212072") |>
+  qs_read()
+
+gene_feature_counts_raw <- syn("syn75212034") |>
   qs_read()
 ```
 
@@ -45,8 +47,8 @@ tximport_raw <- syn("syn75212072") |>
 ```{r}
 repeat_whitelist <- c(
   "SINE/Alu", "SINE/MIR", "SINE/tRNA",
-  "LINE/L1",  "LINE/L2",
-  "LTR",      "LTR/ERV1", "LTR/ERVK", "LTR/ERVL", "LTR/ERVL-MaLR",
+  "LINE/L1", "LINE/L2",
+  "LTR", "LTR/ERV1", "LTR/ERVK", "LTR/ERVL", "LTR/ERVL-MaLR",
   "Retroposon/SVA"
 )
 
@@ -80,19 +82,15 @@ gc()
 ## Normalize repeat counts
 
 ```{r}
-
-# gene_counts_raw <- syn("syn75212034") |>
-#   qs_read()
-
 setdiff(
   colnames(te_counts_mat_filtered),
-  colnames(tximport_raw$counts)
+  colnames(gene_tximport_raw$counts)
 )
 
 de_genes <- DESeqDataSetFromTximport(
-  tximport_raw,
+  gene_tximport_raw,
   colData = tibble(
-    sample_id = colnames(tximport_raw$counts)
+    sample_id = colnames(gene_tximport_raw$counts)
   ),
   design = ~ 1
 ) |>

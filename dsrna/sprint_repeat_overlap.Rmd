@@ -3,7 +3,7 @@ library(tidyverse)
 library(synExtra)
 library(here)
 library(powerjoin)
-library(qs)
+library(qs2)
 library(ggbeeswarm)
 library(ggrepel)
 
@@ -19,8 +19,8 @@ sprint_all <- syn("syn64942445") %>%
 sprint_repeat_edits_old <- syn("syn64376905") %>%
   read_csv()
 
-liu_repeat_counts <- syn("syn64829593") %>%
-  qread()
+liu_repeat_counts <- syn("syn74844895") %>%
+  qs_read()
 
 rm_raw <- syn("syn55256576") %>%
   read_csv()
@@ -686,11 +686,11 @@ de <- DESeqDataSetFromMatrix(
 sizeFactors(de) <- liu_meta$size_factor
 des <- DESeq(de)
 
-qsave(
+qs_save(
   des,
-  file.path("dsrna", "data", "liu_repeat_de.qs")
+  file.path("dsrna", "data", "liu_repeat_de.qs2")
 )
-des <- qread(file.path("dsrna", "data", "liu_repeat_de.qs"))
+# des <- qs_read(file.path("dsrna", "data", "liu_repeat_de.qs2"))
 ```
 
 
@@ -1101,8 +1101,8 @@ highlighted_rep_family <- c(
 p <- res_tdp43_family_stats %>%
   ggplot(
     aes(
-      n_de,
-      prop_de,
+      n_up,
+      prop_up,
       text = class_family
     )
   ) +
@@ -1129,8 +1129,8 @@ p <- res_tdp43_family_stats %>%
   ) +
   scale_x_log10() +
   labs(
-    x = "N differentially expressed",
-    y = "Proportion differentially expressed"
+    x = "N upregulated",
+    y = "Proportion upregulated"
   )
 
 plotly::ggplotly(

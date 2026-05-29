@@ -144,9 +144,13 @@ p <- ggplot(
   scale_y_continuous(
     expand = expansion(mult = c(0.1, 0.15))
   ) +
+  guides(
+    fill = guide_legend(nrow = 2, byrow = TRUE)
+  ) +
   labs(
     x = NULL,
-    y = "Log2 Odds Ratio vs\ngenomic distribution"
+    y = "Log2 Odds Ratio vs\ngenomic distribution",
+    fill = "TE set"
   ) +
   envalysis::theme_publish() +
   theme(
@@ -156,7 +160,7 @@ p
 
 ggsave(
   here("dsrna", "plots", "de_te_location_odds_ratio.pdf"),
-  p, width = 4, height = 3
+  p, width = 5, height = 3.5
 )
 ```
 
@@ -172,10 +176,16 @@ p <- ggplot(
     y = prob
   )
 ) +
+  geom_vline(
+    xintercept = seq(1.5, length(unique(mdl_em_df$Feature)) - 0.5),
+    color = "grey80",
+    linewidth = .5
+  ) +
   geom_point(
     aes(
       color = sample
     ),
+    size = 3,
     position = position_dodge(width = 0.9)
   ) +
   geom_errorbar(
@@ -186,9 +196,13 @@ p <- ggplot(
     position = position_dodge2(width = 0.9)
   ) +
   scale_y_log10() +
+  guides(
+    color = guide_legend(nrow = 2, byrow = TRUE)
+  ) +
   labs(
     x = NULL,
-    y = "TE location proportion"
+    y = "TE location proportion",
+    color = "TE set"
   ) +
   envalysis::theme_publish() +
   theme(
@@ -196,4 +210,8 @@ p <- ggplot(
   )
 p
 
+ggsave(
+  here("dsrna", "plots", "de_te_location_proportion.pdf"),
+  p, width = 5, height = 3.5
+)
 ```
