@@ -17,6 +17,7 @@ synapser::synLogin()
 syn <- synExtra::synDownloader(normalizePath("~/data"), .cache = TRUE)
 ```
 
+## Load data
 
 ```{r}
 # te_counts_raw <- syn("syn75167623") |>
@@ -34,7 +35,12 @@ rosmap_tdp43_classification <- syn("syn44277761") |>
 
 rosmap_meta_raw <- syn("syn66532355") |>
   read_csv()
+
+tximport_raw <- syn("syn75212072") |>
+  qs_read()
 ```
+
+## Filter repeats
 
 ```{r}
 repeat_whitelist <- c(
@@ -52,6 +58,8 @@ rm_filtered <- rm_raw |>
 all(rm_raw$rep_id == rownames(te_counts_raw$counts))
 
 colnames(te_counts_raw$counts) <- str_remove(colnames(te_counts_raw$counts), "\\.bam$")
+setdiff(colnames(te_counts_raw$counts), rosmap_meta_raw$file_prefix)
+setdiff(colnames(te_counts_raw$counts), rosmap_tdp43_classification$file)
 
 common_samples <- intersect(
   rosmap_meta_raw$file_prefix,
@@ -63,18 +71,15 @@ te_counts_mat_filtered <- te_counts_raw$counts[
   rm_filtered$rep_id, common_samples
 ]
 
-setdiff(colnames(te_counts_mat_filtered), rosmap_meta_raw$file_prefix)
-setdiff(colnames(te_counts_mat_filtered), rosmap_tdp43_classification$file)
 rm(te_counts_raw)
 gc()
 ```
 
-56 samples missing from metadata
+56 samples missing from metadata, keeping only common samples
 
+## Normalize repeat counts
 
 ```{r}
-tximport_raw <- syn("syn75212072") |>
-  qs_read()
 
 # gene_counts_raw <- syn("syn75212034") |>
 #   qs_read()
@@ -107,17 +112,12 @@ te_counts_mat_norm <- sweep(
 )
 ```
 
+## Format metadata
 
 ```{r}
 pcc_meta <- rosmap_meta_raw |>
   filter(
     brain_region == "PCC"
-  ) |>
-  dplyr::slice(
-    match(
-      common_samples,
-      file_prefix
-    )
   ) |>
   power_inner_join(
     rosmap_tdp43_classification |>
@@ -155,6 +155,7 @@ pcc_meta <- rosmap_meta_raw |>
   )
 ```
 
+## Aggregate repeat counts by family
 
 ```{r}
 summary_funs <- list(
@@ -214,118 +215,7 @@ agg_counts_meta <- agg_counts |>
   )
 ```
 
-```{r}
-p <- ggplot(
-  agg_counts_meta |>
-    filter(summary_fun == "sum", class_family == "SINE/Alu"),
-  aes(
-    x = combined_class,
-    y = sum
-  )
-) +
-  geom_quasirandom(
-    alpha = .5
-  ) +
-  geom_boxplot(
-    outlier.shape = NA,
-    fill = NA
-  ) +
-  scale_y_log10() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
-p
-
-p <- ggplot(
-  agg_counts_meta |>
-    filter(
-      summary_fun == "sum", class_family == "LINE/L1"
-    ),
-  aes(
-    x = combined_class,
-    y = sum
-  )
-) +
-  geom_quasirandom(
-    alpha = .5
-  ) +
-  geom_boxplot(
-    outlier.shape = NA,
-    fill = NA
-  ) +
-  scale_y_log10() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
-p
-
-p <- ggplot(
-  agg_counts_meta |>
-    filter(
-      summary_fun == "sum_log1p", class_family == "LINE/L1"
-    ),
-  aes(
-    x = combined_class,
-    y = sum
-  )
-) +
-  geom_quasirandom(
-    alpha = .5
-  ) +
-  geom_boxplot(
-    outlier.shape = NA,
-    fill = NA
-  ) +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
-p
-```
-
-
-```{r}
-p <- ggplot(
-  agg_counts_meta |>
-    filter(
-      summary_fun == "sum_log1p", class_family == "LINE/L1"
-    ),
-  aes(
-    x = interaction(
-      braak_binary,
-      cogdx_full,
-      sep = "|"
-    ),
-    y = sum
-  )
-) +
-  geom_quasirandom(
-    aes(
-      color = tdp43_status
-    ),
-    alpha = .5,
-    dodge.width = .9
-  ) +
-  geom_boxplot(
-    aes(
-      color = tdp43_status
-    ),
-    outlier.shape = NA,
-    fill = NA,
-    position = position_dodge(width = .9)
-  ) +
-  guides(
-    x =  guide_axis_nested(
-      key = key_range_auto(sep = "\\|")
-    )
-  ) +
-  labs(
-    x = NULL,
-    color = "TDP-43 pathology"
-  )
-
-p
-```
-
+## Plot repeat counts
 
 ```{r}
 plot_te_counts <- function(data, family, sfun) {
@@ -394,7 +284,6 @@ pwalk(
   }
 )
 ```
-
 
 ```{r}
 library(emmeans)
