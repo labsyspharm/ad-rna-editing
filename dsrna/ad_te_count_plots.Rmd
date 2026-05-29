@@ -1,0 +1,420 @@
+```{r setup, include=FALSE}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(powerjoin)
+library(qs2)
+library(ggbeeswarm)
+library(ggrepel)
+library(legendry)
+library(DESeq2)
+
+theme_set(
+  theme_minimal(base_family = "Helvetica")
+)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+
+```{r}
+# te_counts_raw <- syn("syn75167623") |>
+#   qs_read()
+te_counts_raw <- qs_read("~/Downloads/amp-ad_full_PCC_repeat_counts_raw-fraction_AND_secondary_noMETA.qs2")
+
+rm_raw <- syn("syn55256576") |>
+  read_csv() |>
+  mutate(
+    rep_id = paste(rep_name, seq_len(n()), sep = "_")
+  )
+
+rosmap_tdp43_classification <- syn("syn44277761") |>
+  read_csv()
+
+rosmap_meta_raw <- syn("syn66532355") |>
+  read_csv()
+```
+
+```{r}
+repeat_whitelist <- c(
+  "SINE/Alu", "SINE/MIR", "SINE/tRNA",
+  "LINE/L1",  "LINE/L2",
+  "LTR",      "LTR/ERV1", "LTR/ERVK", "LTR/ERVL", "LTR/ERVL-MaLR",
+  "Retroposon/SVA"
+)
+
+rm_filtered <- rm_raw |>
+  filter(
+    class_family %in% repeat_whitelist
+  )
+
+all(rm_raw$rep_id == rownames(te_counts_raw$counts))
+
+colnames(te_counts_raw$counts) <- str_remove(colnames(te_counts_raw$counts), "\\.bam$")
+
+common_samples <- intersect(
+  rosmap_meta_raw$file_prefix,
+  colnames(te_counts_raw$counts)
+  # colnames(te_counts_mat_filtered)
+)
+
+te_counts_mat_filtered <- te_counts_raw$counts[
+  rm_filtered$rep_id, common_samples
+]
+
+setdiff(colnames(te_counts_mat_filtered), rosmap_meta_raw$file_prefix)
+setdiff(colnames(te_counts_mat_filtered), rosmap_tdp43_classification$file)
+rm(te_counts_raw)
+gc()
+```
+
+56 samples missing from metadata
+
+
+```{r}
+tximport_raw <- syn("syn75212072") |>
+  qs_read()
+
+# gene_counts_raw <- syn("syn75212034") |>
+#   qs_read()
+
+setdiff(
+  colnames(te_counts_mat_filtered),
+  colnames(tximport_raw$counts)
+)
+
+de_genes <- DESeqDataSetFromTximport(
+  tximport_raw,
+  colData = tibble(
+    sample_id = colnames(tximport_raw$counts)
+  ),
+  design = ~ 1
+) |>
+  estimateSizeFactors()
+
+gene_size_factors <- normalizationFactors(de_genes) %>%
+  apply(2, \(x) exp(mean(log(x)))) |>
+  magrittr::extract(common_samples)
+
+all(names(gene_size_factors) == colnames(te_counts_mat_filtered))
+
+te_counts_mat_norm <- sweep(
+  te_counts_mat_filtered,
+  2,
+  gene_size_factors,
+  "/"
+)
+```
+
+
+```{r}
+pcc_meta <- rosmap_meta_raw |>
+  filter(
+    brain_region == "PCC"
+  ) |>
+  dplyr::slice(
+    match(
+      common_samples,
+      file_prefix
+    )
+  ) |>
+  power_inner_join(
+    rosmap_tdp43_classification |>
+      select(specimenID, n_expressed, class_low, class_high),
+    by = c("specimen_id" = "specimenID"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  mutate(
+    tdp43_status = factor(
+      if_else(class_high == "positive", "TDPpos", "TDPneg"),
+      levels = c("TDPneg", "TDPpos")
+    ),
+    tdp43_status_low = factor(
+      if_else(class_low == "positive", "TDPpos", "TDPneg"),
+      levels = c("TDPneg", "TDPpos")
+    ),
+    braak_binary = factor(
+      if_else(Braak <= 2, "Braak0-2", "Braak3-6"),
+      levels = c("Braak0-2", "Braak3-6")
+    ),
+    cogdx_full = factor(
+      cogdx_full,
+      levels = c(
+        "NCI",
+        "MCI",
+        "MCI+other",
+        "AD",
+        "AD+other",
+        "Other dementia"
+      )
+    )
+  )
+```
+
+
+```{r}
+summary_funs <- list(
+  sum = sum,
+  sum_log1p = \(x) sum(log(x + 1))
+)
+
+setdiff(rm_filtered$rep_id, rownames(te_counts_mat_filtered)) |>
+  length()
+intersect(rm_filtered$rep_id, rownames(te_counts_mat_filtered)) |>
+  length()
+
+agg_counts <- rm_filtered |>
+  group_by(class_family) |>
+  summarize(
+    res = {
+      mat <- te_counts_mat_norm[
+        rep_id,
+      ]
+      map(
+        summary_funs,
+        \(fun) {
+          apply(
+            mat,
+            2,
+            fun
+          ) |>
+            enframe(name = "sample_id", value = "sum")
+        }
+      ) |>
+        bind_rows(.id = "summary_fun") |>
+        list()
+    }
+  ) |>
+  unnest(res)
+```
+
+
+```{r}
+agg_counts_meta <- agg_counts |>
+  power_inner_join(
+    pcc_meta,
+    by = c("sample_id" = "file_prefix"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  mutate(
+    combined_class = fct_cross(
+      cogdx_full,
+      braak_binary,
+      tdp43_status,
+      sep = "_"
+    )
+  )
+```
+
+```{r}
+p <- ggplot(
+  agg_counts_meta |>
+    filter(summary_fun == "sum", class_family == "SINE/Alu"),
+  aes(
+    x = combined_class,
+    y = sum
+  )
+) +
+  geom_quasirandom(
+    alpha = .5
+  ) +
+  geom_boxplot(
+    outlier.shape = NA,
+    fill = NA
+  ) +
+  scale_y_log10() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+p
+
+p <- ggplot(
+  agg_counts_meta |>
+    filter(
+      summary_fun == "sum", class_family == "LINE/L1"
+    ),
+  aes(
+    x = combined_class,
+    y = sum
+  )
+) +
+  geom_quasirandom(
+    alpha = .5
+  ) +
+  geom_boxplot(
+    outlier.shape = NA,
+    fill = NA
+  ) +
+  scale_y_log10() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+p
+
+p <- ggplot(
+  agg_counts_meta |>
+    filter(
+      summary_fun == "sum_log1p", class_family == "LINE/L1"
+    ),
+  aes(
+    x = combined_class,
+    y = sum
+  )
+) +
+  geom_quasirandom(
+    alpha = .5
+  ) +
+  geom_boxplot(
+    outlier.shape = NA,
+    fill = NA
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+p
+```
+
+
+```{r}
+p <- ggplot(
+  agg_counts_meta |>
+    filter(
+      summary_fun == "sum_log1p", class_family == "LINE/L1"
+    ),
+  aes(
+    x = interaction(
+      braak_binary,
+      cogdx_full,
+      sep = "|"
+    ),
+    y = sum
+  )
+) +
+  geom_quasirandom(
+    aes(
+      color = tdp43_status
+    ),
+    alpha = .5,
+    dodge.width = .9
+  ) +
+  geom_boxplot(
+    aes(
+      color = tdp43_status
+    ),
+    outlier.shape = NA,
+    fill = NA,
+    position = position_dodge(width = .9)
+  ) +
+  guides(
+    x =  guide_axis_nested(
+      key = key_range_auto(sep = "\\|")
+    )
+  ) +
+  labs(
+    x = NULL,
+    color = "TDP-43 pathology"
+  )
+
+p
+```
+
+
+```{r}
+plot_te_counts <- function(data, family, sfun) {
+  p <- ggplot(
+    data |>
+      filter(summary_fun == sfun, class_family == family),
+    aes(
+      x = interaction(braak_binary, cogdx_full, sep = "|"),
+      y = sum
+    )
+  ) +
+    geom_quasirandom(
+      aes(color = tdp43_status),
+      alpha = .5,
+      dodge.width = .9,
+      shape = 16
+    ) +
+    geom_boxplot(
+      aes(color = tdp43_status),
+      outlier.shape = NA,
+      fill = NA,
+      position = position_dodge(width = .9)
+    ) +
+    guides(
+      x = guide_axis_nested(key = key_range_auto(sep = "\\|"))
+    ) +
+    labs(
+      x = NULL,
+      y = recode_values(
+        sfun,
+        "sum" ~ "Sum repeat counts",
+        "sum_log1p" ~ "Sum log(repeat counts + 1)"
+      ),
+      color = "TDP-43 pathology",
+      title = family
+    )
+
+  if (sfun != "sum_log1p") {
+    p <- p + scale_y_log10()
+  }
+  p
+}
+
+all_te_plots <- expand_grid(
+  family = unique(agg_counts_meta$class_family),
+  sfun = names(summary_funs)
+) |>
+  mutate(
+    plot = map2(family, sfun, \(f, s) plot_te_counts(agg_counts_meta, f, s))
+  )
+
+dir.create(
+  here("dsrna", "plots", "ad_pcc_te_counts"),
+  showWarnings = FALSE
+)
+
+pwalk(
+  all_te_plots,
+  \(family, sfun, plot) {
+    ggsave(
+      here("dsrna", "plots", "ad_pcc_te_counts", paste0(janitor::make_clean_names(family), "_", sfun, ".pdf")),
+      plot,
+      width = 10,
+      height = 4
+    )
+  }
+)
+```
+
+
+```{r}
+library(emmeans)
+
+mod <- lm(
+  log10(sum) ~ tdp43_status * braak_binary * cogdx_primary,
+  data = agg_counts_meta |>
+    filter(
+      summary_fun == "sum",
+      class_family == "Retroposon/SVA"
+    )
+)
+
+emmeans(
+  mod,
+  ~ tdp43_status | cogdx_primary * braak_binary
+) |>
+  contrast(
+    method = "revpairwise"
+  )
+
+
+```
