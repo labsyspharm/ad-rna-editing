@@ -495,29 +495,33 @@ agg_counts_vs_isg_models <- agg_counts_vs_isg |>
   summarize(
     res_adj = {
       mod <- lm(isg_score ~ log1p_te_sum + sex + RIN + sequencingBatch + Study, data = cur_data()) |>
-        tidy() |>
         list()
     },
     res_no_rin = {
       mod <- lm(isg_score ~ log1p_te_sum + sex + sequencingBatch + Study, data = cur_data()) |>
-        tidy() |>
         list()
     },
     res_w_pmi = {
       mod <- lm(isg_score ~ log1p_te_sum + log1p(pmi) + sex + sequencingBatch + Study, data = cur_data()) |>
-        tidy() |>
         list()
     },
     res = {
       mod <- lm(isg_score ~ log1p_te_sum, data = cur_data()) |>
-        tidy() |>
         list()
     },
      .groups = "drop"
   )
-print(agg_counts_vs_isg_models, n = Inf)
 
-agg_counts_vs_isg_models |>
+agg_counts_vs_isg_res <- agg_counts_vs_isg_models |>
+  mutate(
+    across(
+      starts_with("res"),
+      \(res) map(res, tidy)
+    )
+  )
+print(agg_counts_vs_isg_res, n = Inf)
+
+agg_counts_vs_isg_res |>
   filter(summary_fun == "sum") |>
   select(class_family, res_no_rin) |>
   unnest(res_no_rin) |>
@@ -527,7 +531,7 @@ agg_counts_vs_isg_models |>
     sig_label = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", "ns"))
   )
 
-agg_counts_vs_isg_models |>
+agg_counts_vs_isg_res |>
   filter(summary_fun == "sum") |>
   select(class_family, res_w_pmi) |>
   unnest(res_w_pmi) |>
@@ -537,7 +541,7 @@ agg_counts_vs_isg_models |>
     sig_label = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", "ns"))
   )
 
-agg_counts_vs_isg_models |>
+agg_counts_vs_isg_res |>
   filter(summary_fun == "sum") |>
   select(class_family, res) |>
   unnest(res) |>
@@ -547,7 +551,7 @@ agg_counts_vs_isg_models |>
     sig_label = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", "ns"))
   )
 
-agg_counts_vs_isg_models |>
+agg_counts_vs_isg_res |>
   filter(summary_fun == "sum") |>
   select(class_family, res_adj) |>
   unnest(res_adj) |>
