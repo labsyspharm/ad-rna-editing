@@ -1,0 +1,618 @@
+```{r setup, include=FALSE}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(powerjoin)
+library(qs2)
+library(ggbeeswarm)
+library(ggrepel)
+library(legendry)
+library(DESeq2)
+library(broom)
+
+theme_set(
+  theme_minimal(base_family = "Helvetica")
+)
+
+synapser::synLogin()
+syn <- synExtra::synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+## Load data
+
+```{r}
+te_counts_raw <- syn("syn75213136") |>
+  qs_read()
+
+rm_raw <- syn("syn55256576") |>
+  read_csv() |>
+  mutate(
+    rep_id = paste(rep_name, seq_len(n()), sep = "_")
+  )
+
+rosmap_tdp43_classification <- syn("syn44277761") |>
+  read_csv()
+
+rosmap_meta_raw <- syn("syn66532355") |>
+  read_csv()
+
+gene_tximport_raw <- syn("syn75212072") |>
+  qs_read()
+
+gene_feature_counts_raw <- syn("syn75212034") |>
+  qs_read()
+
+
+rosmap_clinical <- syn("syn3191087") |>
+  read_csv()
+
+specimen_meta <- syn("syn21323366") |>
+  read_csv() |>
+  mutate(
+    specimenID = str_remove(specimenID, fixed("Sample_"))
+  ) |>
+  filter(
+    assay == "rnaSeq"
+  )
+
+rna_meta <- syn("syn21088596") |>
+  read_csv() |>
+  mutate(
+    across(specimenID, \(x) str_remove(x, fixed("Sample_")))
+  )
+
+is_genes <- syn("syn11629935") %>%
+  read_lines()
+```
+
+
+```{r}
+repeat_whitelist <- c(
+  "SINE/Alu", "SINE/MIR", "SINE/tRNA",
+  "LINE/L1", "LINE/L2",
+  "LTR", "LTR/ERV1", "LTR/ERVK", "LTR/ERVL", "LTR/ERVL-MaLR",
+  "Retroposon/SVA"
+)
+
+rm_filtered <- rm_raw |>
+  filter(
+    class_family %in% repeat_whitelist
+  )
+
+all(rm_raw$rep_id == rownames(te_counts_raw$counts))
+
+colnames(te_counts_raw$counts) <- str_remove(colnames(te_counts_raw$counts), "\\.bam$")
+setdiff(colnames(te_counts_raw$counts), rosmap_meta_raw$file_prefix)
+setdiff(colnames(te_counts_raw$counts), rosmap_tdp43_classification$file)
+
+common_samples <- intersect(
+  rosmap_meta_raw$file_prefix,
+  colnames(te_counts_raw$counts)
+  # colnames(te_counts_mat_filtered)
+)
+
+te_counts_mat_filtered <- te_counts_raw$counts[
+  rm_filtered$rep_id, common_samples
+]
+
+rm(te_counts_raw)
+gc()
+```
+
+56 samples missing from metadata, keeping only common samples
+
+## Normalize repeat counts
+
+```{r}
+setdiff(
+  colnames(te_counts_mat_filtered),
+  colnames(gene_tximport_raw$counts)
+)
+
+de_genes <- DESeqDataSetFromTximport(
+  gene_tximport_raw,
+  colData = tibble(
+    sample_id = colnames(gene_tximport_raw$counts)
+  ),
+  design = ~ 1
+) |>
+  estimateSizeFactors()
+
+gene_size_factors <- normalizationFactors(de_genes) |>
+  apply(2, \(x) exp(mean(log(x)))) |>
+  magrittr::extract(common_samples)
+
+all(names(gene_size_factors) == colnames(te_counts_mat_filtered))
+
+te_counts_mat_norm <- sweep(
+  te_counts_mat_filtered,
+  2,
+  gene_size_factors,
+  "/"
+)
+
+gene_counts_norm <- counts(de_genes, normalized = TRUE)
+```
+
+
+## Format metadata
+
+```{r}
+pcc_meta <- rosmap_meta_raw |>
+  filter(
+    brain_region == "PCC"
+  ) |>
+  power_inner_join(
+    rosmap_tdp43_classification |>
+      select(specimenID, n_expressed, class_low, class_high),
+    by = c("specimen_id" = "specimenID"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  power_inner_join(
+    rna_meta |>
+      select(specimenID, libraryBatch, sequencingBatch, RIN),
+    by = c("specimen_id" = "specimenID"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  power_inner_join(
+    specimen_meta |>
+      select(specimenID, exclude),
+    by = c("specimen_id" = "specimenID"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  power_inner_join(
+    rosmap_clinical |>
+      transmute(individualID, Study, age_death, sex = if_else(msex == 1, "M", "F"), pmi),
+    by = c("individualID" = "individualID"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  mutate(
+    age_death_numeric = str_remove(age_death, fixed("+")) |> as.numeric(),
+    tdp43_status = factor(
+      if_else(class_high == "positive", "TDPpos", "TDPneg"),
+      levels = c("TDPneg", "TDPpos")
+    ),
+    tdp43_status_low = factor(
+      if_else(class_low == "positive", "TDPpos", "TDPneg"),
+      levels = c("TDPneg", "TDPpos")
+    ),
+    braak_binary = factor(
+      if_else(Braak <= 2, "Braak0-2", "Braak3-6"),
+      levels = c("Braak0-2", "Braak3-6")
+    ),
+    cogdx_full = factor(
+      cogdx_full,
+      levels = c(
+        "NCI",
+        "MCI",
+        "MCI+other",
+        "AD",
+        "AD+other",
+        "Other dementia"
+      )
+    ),
+    across(
+      c(
+        Study, sequencingBatch, libraryBatch, sex
+      ),
+      as.factor
+    )
+  )
+
+p <- GGally::ggpairs(
+  select(
+    pcc_meta,
+    sex, age_death_numeric, RIN, pmi, sequencingBatch, Study, tdp43_status
+  )
+)
+p
+ggsave(
+  file.path("dsrna", "plots", "rosmap_pcc_meta_correlations.pdf"),
+  p, width = 10, height = 10
+)
+```
+
+
+
+## Aggregate repeat counts by family
+
+```{r}
+summary_funs <- list(
+  sum = sum,
+  sum_log1p = \(x) sum(log(x + 1))
+)
+
+setdiff(rm_filtered$rep_id, rownames(te_counts_mat_filtered)) |>
+  length()
+intersect(rm_filtered$rep_id, rownames(te_counts_mat_filtered)) |>
+  length()
+
+agg_counts <- rm_filtered |>
+  group_by(class_family) |>
+  summarize(
+    res = {
+      mat <- te_counts_mat_norm[
+        rep_id,
+      ]
+      map(
+        summary_funs,
+        \(fun) {
+          apply(
+            mat,
+            2,
+            fun
+          ) |>
+            enframe(name = "sample_id", value = "te_sum")
+        }
+      ) |>
+        bind_rows(.id = "summary_fun") |>
+        list()
+    }
+  ) |>
+  unnest(res)
+```
+
+
+## Aggregate ISGs
+
+```{r}
+isg_counts <- gene_counts_norm[intersect(rownames(gene_counts_norm), is_genes), , drop = FALSE]
+isg_means <- rowMeans(isg_counts)
+
+isg_expressed <- names(isg_means)[isg_means > 5]
+isg_counts_expressed <- isg_counts[isg_expressed, , drop = FALSE]
+isg_scores <- scale(t(log1p(isg_counts_expressed)), center = TRUE, scale = TRUE) |>
+  rowMeans() |>
+  enframe(name = "sample_id", value = "isg_score")
+```
+
+## Merge ISG scores, repeat counts, and metadata
+
+```{r}
+agg_counts_vs_isg <- agg_counts |>
+  power_inner_join(
+    isg_scores,
+    by = "sample_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  power_inner_join(
+    pcc_meta,
+    by = c("sample_id" = "file_prefix"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  mutate(
+    log1p_te_sum = log1p(te_sum)
+  )
+```
+
+## Plot raw relationships between ISG scores and TE counts, covariates
+
+```{r}
+p <- ggplot(
+  agg_counts_vs_isg |>
+    filter(summary_fun == "sum", class_family == "SINE/Alu"),
+  aes(
+    x = RIN,
+    y = isg_score
+  )
+) +
+  geom_point() +
+  geom_smooth(method = "lm")
+p
+
+# lm(
+#   isg_score ~ RIN,
+#   data = agg_counts_vs_isg |>
+#     filter(summary_fun == "sum", class_family == "SINE/Alu")
+# ) |>
+#   summary()
+
+ggsave(
+  file.path("dsrna", "plots", "isg_vs_te", "isg_vs_rin.pdf"),
+  p, width = 4, height = 3
+)
+
+p <- ggplot(
+  agg_counts_vs_isg |>
+    filter(summary_fun == "sum", class_family == "SINE/Alu"),
+  aes(
+    x = log1p(pmi),
+    y = isg_score
+  )
+) +
+  geom_point() +
+  geom_smooth(method = "lm")
+p
+
+# lm(
+#   isg_score ~ RIN,
+#   data = agg_counts_vs_isg |>
+#     filter(summary_fun == "sum", class_family == "SINE/Alu")
+# ) |>
+#   summary()
+
+ggsave(
+  file.path("dsrna", "plots", "isg_vs_te", "isg_vs_rin.pdf"),
+  p, width = 4, height = 3
+)
+
+p <- ggplot(
+  agg_counts_vs_isg |>
+    filter(summary_fun == "sum", class_family == "SINE/Alu"),
+  aes(
+    x = sequencingBatch,
+    y = isg_score
+  )
+) +
+  geom_quasirandom()
+p
+
+
+p <- ggplot(
+  agg_counts_vs_isg |>
+    filter(summary_fun == "sum", class_family == "SINE/Alu"),
+  aes(
+    x = Study,
+    y = isg_score
+  )
+) +
+  geom_quasirandom()
+p
+
+p <- ggplot(
+  agg_counts_vs_isg |>
+    filter(summary_fun == "sum"),
+  aes(
+    x = RIN,
+    y = log1p_te_sum
+  )
+) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  facet_wrap(~ class_family, scales = "free_y")
+p
+
+p <- ggplot(
+  agg_counts_vs_isg |>
+    filter(summary_fun == "sum"),
+  aes(
+    x = sequencingBatch,
+    y = log1p(te_sum)
+  )
+) +
+  geom_quasirandom() +
+  facet_wrap(~ class_family, scales = "free_y")
+p
+
+p <- ggplot(
+  agg_counts_vs_isg |>
+    filter(summary_fun == "sum"),
+  aes(
+    x = Study,
+    y = log1p_te_sum
+  )
+) +
+  geom_quasirandom() +
+  facet_wrap(~ class_family, scales = "free_y")
+p
+```
+
+
+```{r}
+p <- ggplot(
+  agg_counts_vs_isg |>
+    filter(summary_fun == "sum"),
+  aes(
+    x = log1p(te_sum),
+    y = isg_score
+  )
+) +
+  geom_point(
+    alpha = .7
+  ) +
+  geom_smooth(
+    method = "lm"
+  ) +
+  facet_wrap(~ class_family, scales = "free")
+p
+
+p <- ggplot(
+  agg_counts_vs_isg |>
+    filter(summary_fun == "sum"),
+  aes(
+    x = log1p(te_sum),
+    y = isg_score
+  )
+) +
+  geom_point(
+    aes(
+      color = RIN
+    ),
+    alpha = .7,
+    shape = 16
+  ) +
+  geom_smooth(
+    method = "lm"
+  ) +
+  scale_color_viridis_c(
+    direction = -1,
+    option = "plasma"
+  ) +
+  facet_wrap(~ class_family, scales = "free")
+p
+
+ggsave(
+  file.path("dsrna", "plots", "isg_vs_te", "isg_vs_te_by_rin.pdf"),
+  p, width = 8, height = 6
+)
+
+p <- ggplot(
+  agg_counts_vs_isg |>
+    filter(summary_fun == "sum"),
+  aes(
+    x = log1p(te_sum),
+    y = isg_score
+  )
+) +
+  geom_point(
+    aes(
+      color = cogdx_primary
+    ),
+    alpha = .7,
+    shape = 16
+  ) +
+  geom_smooth(
+    method = "lm"
+  ) +
+  facet_wrap(~ class_family, scales = "free")
+p
+```
+
+## Fit linear models of ISG scores vs TE counts, with and without covariates
+
+```{r}
+agg_counts_vs_isg_models <- agg_counts_vs_isg |>
+  group_by(class_family, summary_fun) |>
+  summarize(
+    res_adj = {
+      mod <- lm(isg_score ~ log1p_te_sum + sex + RIN + sequencingBatch + Study, data = cur_data()) |>
+        tidy() |>
+        list()
+    },
+    res_no_rin = {
+      mod <- lm(isg_score ~ log1p_te_sum + sex + sequencingBatch + Study, data = cur_data()) |>
+        tidy() |>
+        list()
+    },
+    res_w_pmi = {
+      mod <- lm(isg_score ~ log1p_te_sum + log1p(pmi) + sex + sequencingBatch + Study, data = cur_data()) |>
+        tidy() |>
+        list()
+    },
+    res = {
+      mod <- lm(isg_score ~ log1p_te_sum, data = cur_data()) |>
+        tidy() |>
+        list()
+    },
+     .groups = "drop"
+  )
+print(agg_counts_vs_isg_models, n = Inf)
+
+agg_counts_vs_isg_models |>
+  filter(summary_fun == "sum") |>
+  select(class_family, res_no_rin) |>
+  unnest(res_no_rin) |>
+  filter(term == "log1p_te_sum") |>
+  mutate(
+    padj = p.adjust(p.value, method = "BH"),
+    sig_label = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", "ns"))
+  )
+
+agg_counts_vs_isg_models |>
+  filter(summary_fun == "sum") |>
+  select(class_family, res_w_pmi) |>
+  unnest(res_w_pmi) |>
+  filter(term == "log1p_te_sum") |>
+  mutate(
+    padj = p.adjust(p.value, method = "BH"),
+    sig_label = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", "ns"))
+  )
+
+agg_counts_vs_isg_models |>
+  filter(summary_fun == "sum") |>
+  select(class_family, res) |>
+  unnest(res) |>
+  filter(term == "log1p_te_sum") |>
+  mutate(
+    padj = p.adjust(p.value, method = "BH"),
+    sig_label = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", "ns"))
+  )
+
+agg_counts_vs_isg_models |>
+  filter(summary_fun == "sum") |>
+  select(class_family, res_adj) |>
+  unnest(res_adj) |>
+  filter(term == "log1p_te_sum") |>
+  mutate(
+    padj = p.adjust(p.value, method = "BH"),
+    sig_label = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", "ns"))
+  )
+```
+
+###
+
+```{r}
+agg_counts_vs_isg_resid <- agg_counts_vs_isg |>
+  group_by(class_family, summary_fun) |>
+  summarize(
+    res = {
+      mod_isg <- lm(isg_score ~ sex + RIN + sequencingBatch + Study, data = cur_data())
+      mod_te <- lm(log1p_te_sum ~ sex + RIN + sequencingBatch + Study, data = cur_data())
+      resid_isg <- resid(mod_isg)
+      resid_te <- resid(mod_te)
+      mutate(
+        cur_data(),
+        resid_isg = resid_isg,
+        resid_te = resid_te
+      ) |>
+        list()
+    },
+     .groups = "drop"
+  ) |>
+  unnest(res)
+
+agg_counts_vs_isg_resid_models <- agg_counts_vs_isg_resid |>
+  group_by(class_family, summary_fun) |>
+  summarize(
+    res = {
+      mod <- lm(resid_isg ~ resid_te, data = cur_data()) |>
+        tidy() |>
+        list()
+    },
+     .groups = "drop"
+  )
+```
+
+
+
+```{r}
+p <- ggplot(
+  agg_counts_vs_isg_resid |>
+    filter(summary_fun == "sum"),
+  aes(
+    x = resid_te,
+    y = resid_isg
+  )
+) +
+  geom_point(
+    alpha = .7
+  ) +
+  geom_smooth(
+    method = "lm"
+  ) +
+  facet_wrap(~ class_family, scales = "free") +
+  labs(
+    x = "TE count (residualised on covariates)",
+    y = "ISG score (residualised on covariates)"
+  )
+p
+```
