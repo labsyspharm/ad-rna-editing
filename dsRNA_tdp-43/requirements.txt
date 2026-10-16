@@ -1,0 +1,8 @@
+synapseclient
+pandas
+numpy
+scipy
+statsmodels
+matplotlib
+openpyxl
+pypdf
