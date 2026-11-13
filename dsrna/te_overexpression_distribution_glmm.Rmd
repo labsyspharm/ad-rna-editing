@@ -1,0 +1,318 @@
+---
+title: "TE proportions"
+author: "Clemens Hug"
+output:
+  html_document:
+    theme: flatly
+    toc: yes
+    number_sections: true
+    toc_float:
+      collapsed: false
+    toc_depth: 4
+    code_folding: hide
+    self_contained: true
+---
+
+```{r setup}
+library(conflicted)
+library(tidyverse)
+library(powerjoin)
+library(here)
+library(emmeans)
+library(lme4)
+library(synExtra)
+library(ggbeeswarm)
+library(patchwork)
+
+conflicts_prefer(
+  dplyr::filter,
+  dplyr::count,
+  generics::setdiff,
+  dplyr::slice,
+  dplyr::rename,
+  purrr::reduce
+)
+
+theme_set(
+  theme_minimal(base_family = "Helvetica")
+)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+## Loading data
+
+```{r}
+te_by_sample <- syn("syn78684707") |>
+  read_csv() |>
+  mutate(
+    Sample = factor(Sample),
+    Group = factor(Group, levels = c("TDP43+", "TDP43-"))
+  )
+
+plot_dir <- here("dsrna", "plots")
+```
+
+## Total TE expression
+
+Is overall TE expression higher in TDP43- nuclei?
+
+```{r}
+te_by_lib <- te_by_sample |>
+  group_by(Sample, SRR, Group, size_factor) |>
+  summarize(
+    te_counts = round(sum(sum_raw_counts)),
+    te_counts_norm = sum(sum_normalized_counts),
+    .groups = "drop"
+  )
+
+mdl_total <- glmer.nb(
+  te_counts ~ Group + offset(log(size_factor)) + (1 | Sample),
+  data = te_by_lib
+)
+emmeans(mdl_total, revpairwise ~ Group, type = "response")$contrasts
+```
+
+## TE expression by family
+
+```{r}
+te_by_lib_family <- te_by_sample |>
+  group_by(Sample, SRR, Group, TE_family, size_factor) |>
+  summarize(
+    te_counts = round(sum(sum_raw_counts)),
+    te_counts_norm = sum(sum_normalized_counts),
+    .groups = "drop"
+  )
+
+mdl_total <- glmer.nb(
+  te_counts ~ Group * TE_family + offset(log(size_factor)) + (1 | Sample / TE_family) + (1 | SRR),
+  data = te_by_lib_family
+)
+
+family_ratios_mdl <- emmeans(mdl_total, ~ Group | TE_family, type = "response") |>
+  contrast(method = "revpairwise") |>
+  update(by = NULL, adjust = "fdr") |>
+  summary(infer = TRUE) |>
+  as_tibble()
+
+joint_tests(mdl_total, adjust = "fdr")
+
+# This is the ratio of each family's TDP43 pathology effect relative
+# to the average effect across all families
+family_ror_mdl <- emmeans(mdl_total, ~ Group | TE_family) |>
+  contrast(interaction = c("revpairwise", "eff"), by = NULL, adjust = "fdr") |>
+  summary(infer = TRUE, type = "response") |>
+  as_tibble() |>
+  mutate(TE_family = str_remove_all(TE_family_eff, "^\\(|\\)? effect$"))
+```
+
+Gettig the observed per familly ratios
+
+```{r}
+family_ratios_obs <- te_by_lib_family |>
+  pivot_wider(
+    names_from = Group, values_from = te_counts_norm,
+    id_cols = c(TE_family, Sample)
+  ) |>
+  mutate(ratio = `TDP43-` / `TDP43+`)
+
+family_order <- family_ratios_mdl |>
+  arrange(ratio) |>
+  pull(TE_family)
+
+p_ratios <- ggplot(
+  mapping = aes(
+    x = factor(TE_family, levels = family_order)
+  )
+) +
+  geom_hline(yintercept = 1, color = "#898781", linewidth = 0.4) +
+  geom_quasirandom(
+    aes(y = ratio, fill = "Individual donors"),
+    data = family_ratios_obs,
+    width = 0.25, color = "gray"
+  ) +
+  geom_pointrange(
+    aes(y = ratio, ymin = asymp.LCL, ymax = asymp.UCL, color = "GLMM estimate (95% CI)"),
+    data = family_ratios_mdl
+  ) +
+  geom_text(
+    aes(
+      y = max(family_ratios_obs$ratio) * 1.05,
+      label = paste0(
+        sprintf("%.2f", ratio), "\n",
+        if_else(
+          p.value < 1e-4, "p<1e-4",
+          paste0("p=", signif(p.value, 1))
+        )
+      )
+    ),
+    data = family_ratios_mdl,
+    size = 2.8,
+    lineheight = 0.9
+  ) +
+  scale_y_continuous(
+    trans = "log2",
+    breaks = c(.9, 1, 1.1, 1.2, 1.3, 1.4)
+  ) +
+  # scale_x_discrete(expand = expansion(add = c(0.6, 1))) +
+  coord_flip(clip = "off") +
+  labs(
+    x = NULL,
+    y = "TE expression ratio TDP43- / TDP43+",
+    color = NULL,
+    fill = NULL,
+    caption = "Liu et al."
+  ) +
+  theme(
+    panel.grid.major.y = element_line(),
+    panel.grid.minor = element_line(),
+    legend.position = "top",
+    legend.justification = "center",
+    legend.margin = margin(0, 0, 0, 0)
+  )
+p_ratios
+
+ggsave(
+  file.path(plot_dir, "te_family_ratio_quasirandom.pdf"),
+  p_ratios, width = 6, height = 5
+)
+```
+
+Each family's TDP43- / TDP43+ ratio relative to the average ratio across all
+families. Values > 1 mean the family increases more than TEs
+overall in TDP43- nuclei.
+
+```{r}
+
+family_ror_obs <- family_ratios_obs |>
+  group_by(Sample) |>
+  mutate(ror = ratio / exp(mean(log(ratio)))) |>
+  ungroup()
+
+p_ror <- ggplot(
+  mapping = aes(
+    x = factor(TE_family, levels = family_order)
+  )
+) +
+  geom_hline(yintercept = 1, color = "#898781", linewidth = 0.4) +
+  geom_quasirandom(
+    aes(y = ror, fill = "Individual donors"),
+    data = family_ror_obs,
+    width = 0.25, color = "gray"
+  ) +
+  geom_pointrange(
+    aes(y = ratio, ymin = asymp.LCL, ymax = asymp.UCL, color = "GLMM estimate (95% CI)"),
+    data = family_ror_mdl
+  ) +
+  geom_text(
+    aes(
+      y = max(family_ror_obs$ror) * 1.05,
+      label = paste0(
+        sprintf("%.2f", ratio), "\n",
+        if_else(
+          p.value < 1e-4, "p<1e-4",
+          paste0("p=", signif(p.value, 1))
+        )
+      )
+    ),
+    data = family_ror_mdl,
+    size = 2.8,
+    lineheight = 0.9
+  ) +
+  scale_y_continuous(
+    trans = "log2",
+    breaks = c(.8, .9, 1, 1.1, 1.2)
+  ) +
+  coord_flip(clip = "off") +
+  labs(
+    x = NULL,
+    y = "TE ratio relative to average TE ratio TDP43- / TDP43+",
+    color = NULL,
+    fill = NULL,
+    caption = "Liu et al."
+  ) +
+  theme(
+    panel.grid.major.y = element_line(),
+    panel.grid.minor = element_line(),
+    legend.position = "top",
+    legend.justification = "center",
+    legend.margin = margin(0, 0, 0, 0)
+  )
+p_ror
+
+p_ratios_combined <- (
+  (p_ratios + labs(caption = NULL)) +
+    (p_ror + theme(axis.text.y = element_blank()))
+) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "top")
+p_ratios_combined
+
+ggsave(
+  file.path(plot_dir, "te_family_ratio_and_ror_quasirandom.pdf"),
+  p_ratios_combined, width = 8, height = 4
+)
+```
+
+
+## TE expression by genomic location
+
+Same analysis as above, but aggregating TE counts by genomic location
+instead of TE family.
+
+```{r}
+te_by_lib_location <- te_by_sample |>
+  group_by(Sample, SRR, Group, Genomic_location, size_factor) |>
+  summarize(
+    te_counts = round(sum(sum_raw_counts)),
+    te_counts_norm = sum(sum_normalized_counts),
+    .groups = "drop"
+  ) |>
+  mutate(Genomic_location = factor(Genomic_location))
+
+mdl_location <- glmer.nb(
+  te_counts ~ Group * Genomic_location + offset(log(size_factor)) +
+    (1 | Sample / Genomic_location) + (1 | SRR),
+  data = te_by_lib_location
+)
+
+joint_tests(mdl_location)
+```
+
+TDP43- / TDP43+ ratio per genomic location.
+
+```{r}
+location_ratios_mdl <- emmeans(mdl_location, ~ Group | Genomic_location, type = "response") |>
+  contrast(method = "revpairwise") |>
+  update(by = NULL, adjust = "fdr") |>
+  summary(infer = TRUE) |>
+  as_tibble()
+
+location_ratios_mdl
+
+location_ratios_obs <- te_by_lib_location |>
+  pivot_wider(
+    names_from = Group, values_from = te_counts_norm,
+    id_cols = c(Genomic_location, Sample)
+  ) |>
+  mutate(ratio = `TDP43-` / `TDP43+`)
+```
+
+```{r}
+location_ror_mdl <- emmeans(mdl_location, ~ Group | Genomic_location) |>
+  contrast(interaction = c("revpairwise", "eff"), by = NULL, adjust = "fdr") |>
+  summary(infer = TRUE, type = "response") |>
+  as_tibble() |>
+  mutate(
+    Genomic_location = str_remove(Genomic_location_eff, " effect$") |>
+      str_replace("^\\((.*)\\)$", "\\1")
+  )
+
+location_ror_mdl
+
+location_ror_obs <- location_ratios_obs |>
+  group_by(Sample) |>
+  mutate(ror = ratio / exp(mean(log(ratio)))) |>
+  ungroup()
+```
