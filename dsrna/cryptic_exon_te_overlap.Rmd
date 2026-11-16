@@ -445,17 +445,61 @@ cryptic_exons_annotated <- cryptic_exons |>
   replace_na(list(n_repeats = 0L))
 ```
 
+TE-centric, one row per repeat that overlaps at least one cryptic exon.
+
+```{r}
+te_overlapping_cryptic <- te_cryptic_overlap |>
+  group_by(
+    te_id, rep_name, class_family, rep_class, rep_family, seqnames,
+    te_start, te_end, te_strand, te_width,
+    sw_score, perc_div, perc_del, perc_ins
+  ) |>
+  arrange(desc(best_probability_changing), desc(abs(best_dpsi))) |>
+  summarize(
+    n_cryptic_exons = n_distinct(cryptic_id),
+    cryptic_ids = paste(unique(cryptic_id), collapse = ";"),
+    # Cryptic exons can already list several ";"-separated genes, and
+    # gene_name is "" when there is no symbol
+    gene_name = str_split(gene_name, ";") |>
+      unlist() |>
+      setdiff(c("", NA)) |>
+      paste(collapse = ";"),
+    gene_id = paste(unique(unlist(str_split(gene_id, ";"))), collapse = ";"),
+    te_orientations = paste(sort(unique(te_orientation)), collapse = ";"),
+    max_overlap_bp = max(overlap_bp),
+    max_frac_te_in_cryptic = max(frac_te_in_cryptic),
+    max_frac_cryptic_in_te = max(frac_cryptic_in_te),
+    any_de_novo_junction = any(any_de_novo_junction),
+    best_cryptic_id = first(cryptic_id),
+    best_cryptic_type = first(cryptic_type),
+    best_te_orientation = first(te_orientation),
+    best_lsv_id = first(best_lsv_id),
+    best_probability_changing = first(best_probability_changing),
+    best_dpsi = first(best_dpsi),
+    best_TDPneg_psi = first(best_TDPneg_psi),
+    best_TDPpos_psi = first(best_TDPpos_psi),
+    .groups = "drop"
+  ) |>
+  arrange(seqnames, te_start)
+
+te_overlapping_cryptic
+```
+
 ```{r}
 te_cryptic_overlap |>
   distinct(te_id, rep_class) |>
   count(rep_class, sort = TRUE)
 
 p <- ggplot(
-  te_cryptic_overlap,
+  te_cryptic_overlap |>
+    semi_join(
+      repeat_whitelist,
+      by = c("class_family")
+    ),
   aes(frac_te_in_cryptic, frac_cryptic_in_te)
 ) +
   geom_point(alpha = 0.2, size = 0.5) +
-  facet_wrap(~ rep_class) +
+  facet_wrap(~ class_family) +
   labs(
     x = "Fraction of repeat in cryptic exon",
     y = "Fraction of cryptic exon in repeat"
@@ -471,20 +515,12 @@ ggsave(
 
 All tables are written to `data/cryptic_exon_te_overlap/`.
 
-- `lsv_max_junction.csv.gz`: one row per LSV. Holds the dPSI, PSI and
-  change probability of the LSV's most changing junction, plus gene, LSV type
-  and whether any of its junctions is de novo.
-- `cryptic_exons_per_lsv.csv.gz`: one row per cryptic segment per LSV
-  exon (many-to-many between LSVs and cryptic segments). An LSV can yield
-  several segments, and the same segment shows up once for every LSV that
-  contains its exon (e.g. both the source and the target LSV). Use it to go
-  from a cryptic exon back to all of its LSVs.
-- `cryptic_exons.csv.gz`: one row per unique cryptic exon
+- `liu_cryptic_exons.csv.gz`: one row per unique cryptic exon
   (`cryptic_id`), deduplicated across LSVs. Stats come from the most
   changing LSV (`best_*`), and all contributing LSVs are listed in `lsv_ids`.
   Summarizes the overlapping repeats (`n_repeats`, `repeat_names`,
   `repeat_class_families`); `n_repeats = 0` means no overlap.
-- `repeat_cryptic_exon_overlap.csv.gz`: one row per overlapping
+- `liu_repeat_cryptic_exon_pairs.csv.gz`: one row per overlapping
   (repeat, cryptic exon) pair (many-to-many). Contains only repeats that
   overlap a cryptic exon, and strand is ignored. A repeat that spans several
   cryptic exons appears once per exon (`n_cryptic_exons_overlapping_te`), and
@@ -492,19 +528,14 @@ All tables are written to `data/cryptic_exon_te_overlap/`.
   (`n_tes_overlapping_cryptic`). Includes the overlap in bp, the fraction of
   each element that is covered, and the repeat orientation relative to the
   exon (sense/antisense).
+- `liu_repeats_with_cryptic_exons.csv.gz`: one row per repeat
+  (`te_id`). Contains only repeats that overlap at least one cryptic exon.
+  All overlapping cryptic exons are listed in `cryptic_ids` (count in
+  `n_cryptic_exons`), along with their genes and the repeat orientations
+  relative to them. The `best_*` columns describe the overlapping cryptic exon
+  whose LSV changes most.
 
 ```{r}
-write_csv(
-  lsv_max |>
-    select(-exons_coords),
-  file.path(out_dir, "liu_lsv_max_junction.csv.gz")
-)
-
-write_csv(
-  cryptic_per_lsv,
-  file.path(out_dir, "liu_cryptic_exons_per_lsv.csv.gz")
-)
-
 write_csv(
   cryptic_exons_annotated,
   file.path(out_dir, "liu_cryptic_exons.csv.gz")
@@ -512,7 +543,12 @@ write_csv(
 
 write_csv(
   te_cryptic_overlap,
-  file.path(out_dir, "liu_repeat_cryptic_exon_overlap.csv.gz")
+  file.path(out_dir, "liu_repeat_cryptic_exon_pairs.csv.gz")
+)
+
+write_csv(
+  te_overlapping_cryptic,
+  file.path(out_dir, "liu_repeats_with_cryptic_exons.csv.gz")
 )
 ```
 
@@ -527,10 +563,9 @@ synStoreMany(
   file.path(
     out_dir,
     c(
-      "liu_lsv_max_junction.csv.gz",
-      "liu_cryptic_exons_per_lsv.csv.gz",
       "liu_cryptic_exons.csv.gz",
-      "liu_repeat_cryptic_exon_overlap.csv.gz"
+      "liu_repeat_cryptic_exon_pairs.csv.gz",
+      "liu_repeats_with_cryptic_exons.csv.gz"
     )
   ),
   parentId = syn_te_overlap,
