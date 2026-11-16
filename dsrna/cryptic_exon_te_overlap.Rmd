@@ -1,0 +1,539 @@
+---
+title: "Cryptic exon TE overlap"
+author: "Clemens Hug"
+output:
+  html_document:
+    theme: flatly
+    toc: yes
+    number_sections: true
+    toc_float:
+      collapsed: false
+    toc_depth: 4
+    code_folding: hide
+    self_contained: true
+---
+
+```{r setup}
+library(conflicted)
+library(tidyverse)
+library(powerjoin)
+library(here)
+library(synExtra)
+library(GenomicRanges)
+library(rtracklayer)
+
+conflicts_prefer(
+  dplyr::filter,
+  dplyr::count,
+  dplyr::slice,
+  dplyr::rename,
+  dplyr::select,
+  dplyr::first,
+  dplyr::desc,
+  dplyr::between,
+  dplyr::n,
+  purrr::reduce,
+  GenomicRanges::setdiff,
+  GenomicRanges::intersect,
+  GenomicRanges::union
+)
+
+theme_set(
+  theme_minimal(base_family = "Helvetica")
+)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+
+data_dir <- here("dsrna", "data")
+out_dir <- here("dsrna", "data", "cryptic_exon_te_overlap")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Loading data
+
+### VOILA deltapsi LSVs
+
+LSVs are all from Liu et al. data.
+
+One row per LSV (module). Junction-level columns are `;`-separated, one
+entry per junction. Coordinates are 1-based, closed, Ensembl chromosome names.
+
+```{r}
+lsv_raw <- syn("syn78075015") |>
+  read_tsv(comment = "#", col_types = cols(.default = col_character()))
+
+lsv_raw
+```
+
+### RepeatMasker
+
+Raw RepeatMasker `.out` table: 1-based closed coordinates, `C` = minus strand,
+UCSC chromosome names. Converted to Ensembl naming to match MAJIQ / Ensembl GTF.
+
+For plots and stuff only reall use the families of interesst.
+
+```{r}
+rmsk <- syn("syn55256576") |>
+  read_csv(
+    col_types = cols(
+      sw_score = col_integer(), perc_div = col_double(),
+      perc_del = col_double(), perc_ins = col_double(),
+      start = col_integer(), end = col_integer(),
+      id = col_integer(), .default = col_character()
+    )
+  ) |>
+  select(-dummy) |>
+  mutate(
+    te_strand = if_else(strand == "C", "-", "+"),
+    seqnames = str_remove(chromosome, "^chr") |>
+      str_replace("^M$", "MT"),
+    rep_class = str_remove(class_family, "/.*$"),
+    rep_family = str_remove(class_family, "^[^/]*/?") |>
+      na_if(""),
+    te_id = row_number()
+  )
+
+rmsk_gr <- rmsk |>
+  select(
+    seqnames, start, end, strand = te_strand, te_id
+  ) |>
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+
+repeat_whitelist <- tibble(
+  class_family = c(
+    "LINE/L1", "LINE/L2", "LTR", "LTR/ERV1", "LTR/ERVK", "LTR/ERVL",
+    "LTR/ERVL-MaLR", "Retroposon/SVA", "SINE/Alu", "SINE/MIR"
+  )
+)
+```
+
+### Ensembl v113 exons
+
+```{r}
+ensembl_gtf_file <- file.path(data_dir, "Homo_sapiens.GRCh38.113.gtf.gz")
+if (!file.exists(ensembl_gtf_file)) {
+  download.file(
+    "https://ftp.ensembl.org/pub/release-113/gtf/homo_sapiens/Homo_sapiens.GRCh38.113.gtf.gz",
+    ensembl_gtf_file, method = "curl"
+  )
+}
+
+annotated_exons <- readGFF(
+  ensembl_gtf_file,
+  filter = list(type = "exon"),
+  tags = c("gene_id", "gene_name", "transcript_id", "transcript_biotype", "tag")
+) |>
+  as_tibble() |>
+  mutate(
+    is_ensembl_canonical = map_lgl(tag, \(x) "Ensembl_canonical" %in% x)
+  ) |>
+  select(-tag)
+
+annotated_exons |>
+  count(is_ensembl_canonical)
+```
+
+Which annotated exons count as canonical for the subtraction. "all" removes
+any exon annotated in any Ensembl transcript. "ensembl_canonical" only removes
+exons from the single Ensembl canonical transcript per gene, so alternative but
+annotated exons are retained as putative cryptic exons.
+
+All makes more sense imho, we really only want cryptic unannotated exons.
+
+```{r}
+canonical_exon_set <- "all"
+
+canonical_exons_gr <- annotated_exons |>
+  filter(
+    canonical_exon_set == "all" | is_ensembl_canonical
+  ) |>
+  select(seqnames = seqid, start, end, strand) |>
+  makeGRangesFromDataFrame() |>
+  GenomicRanges::reduce()
+
+canonical_exons_gr
+```
+
+## Aggregate each LSV to its most changing junction
+
+For every LSV, pick the junction with the highest probability of changing
+(|dPSI| > 0.2, VOILA default) and report its dPSI and PSI values. Ties are
+broken by larger |dPSI|.
+
+```{r}
+junction_cols <- c(
+  "mean_dpsi_per_lsv_junction", "probability_changing",
+  "probability_non_changing", "TDPneg_mean_psi", "TDPpos_mean_psi",
+  "de_novo_junctions", "junctions_coords"
+)
+
+lsv_junctions <- lsv_raw |>
+  select(lsv_id, all_of(junction_cols)) |>
+  separate_longer_delim(all_of(junction_cols), delim = ";") |>
+  group_by(lsv_id) |>
+  mutate(junction_idx = row_number()) |>
+  ungroup() |>
+  mutate(
+    across(
+      c(
+        mean_dpsi_per_lsv_junction, probability_changing,
+        probability_non_changing, TDPneg_mean_psi, TDPpos_mean_psi
+      ),
+      as.numeric
+    ),
+    de_novo_junctions = de_novo_junctions == "1"
+  )
+
+lsv_max <- lsv_junctions |>
+  group_by(lsv_id) |>
+  arrange(desc(probability_changing), desc(abs(mean_dpsi_per_lsv_junction))) |>
+  slice_head(n = 1) |>
+  ungroup() |>
+  rename(
+    max_junction_idx = junction_idx,
+    max_junction_coords = junctions_coords,
+    max_junction_de_novo = de_novo_junctions,
+    max_probability_changing = probability_changing,
+    max_probability_non_changing = probability_non_changing,
+    max_dpsi = mean_dpsi_per_lsv_junction,
+    max_TDPneg_psi = TDPneg_mean_psi,
+    max_TDPpos_psi = TDPpos_mean_psi
+  ) |>
+  power_left_join(
+    lsv_raw |>
+      select(
+        lsv_id, gene_name, gene_id, lsv_type, num_junctions, num_exons,
+        seqnames = seqid, strand, exons_coords
+      ) |>
+      mutate(
+        gene_id = str_remove(gene_id, "^gene:"),
+        # VOILA fills gene_name with the gene id when there is no symbol
+        gene_name = if_else(str_starts(gene_name, "gene:"), NA, gene_name)
+      ),
+    by = "lsv_id",
+    check = check_specs(
+      unmatched_keys_left = "abort",
+      duplicate_keys_right = "abort"
+    )
+  ) |>
+  mutate(
+    any_de_novo_junction = lsv_id %in% (
+      lsv_junctions |> filter(de_novo_junctions) |> pull(lsv_id)
+    )
+  )
+
+lsv_max
+
+p <- ggplot(lsv_max, aes(max_dpsi, max_probability_changing)) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  labs(
+    x = "dPSI TDP43- vs TDP43+ (most changing junction)",
+    y = "P(|dPSI| > 0.2)"
+  )
+
+ggsave(
+  file.path(out_dir, "liu_lsv_max_dpsi_vs_probability.pdf"),
+  p, width = 6, height = 5
+)
+```
+
+## Exons of each LSV
+
+All exons belonging to the LSV, not just those touched by the most changing
+junction. MAJIQ reports half-exons with an unknown boundary as `na`,
+those can't be placed and are dropped.
+
+```{r}
+lsv_exons <- lsv_max |>
+  select(lsv_id, seqnames, strand, exons_coords) |>
+  separate_longer_delim(exons_coords, delim = ";") |>
+  separate_wider_delim(
+    exons_coords, delim = "-", names = c("start", "end")
+  ) |>
+  mutate(
+    half_exon = start == "na" | end == "na",
+    across(c(start, end), \(x) suppressWarnings(as.integer(x)))
+  )
+
+lsv_exons |>
+  count(half_exon)
+
+lsv_exons_gr <- lsv_exons |>
+  filter(!half_exon) |>
+  select(-half_exon) |>
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+```
+
+## Subtract canonical exons
+
+Strand-aware subtraction of the annotated exons from every LSV exon. What
+remains are the putative cryptic exon segments. A single LSV exon can produce
+multiple segments (e.g. an annotated exon with an unannotated extension on
+both sides).
+
+For min_cryptic_width, let's try 20bp.
+
+```{r}
+min_cryptic_width <- 20L
+
+cryptic_segments_grl <- GenomicRanges::subtract(
+  lsv_exons_gr, canonical_exons_gr, ignore.strand = FALSE
+)
+
+cryptic_per_lsv <- tibble(
+  lsv_id = rep(lsv_exons_gr$lsv_id, lengths(cryptic_segments_grl)),
+  lsv_exon_start = rep(start(lsv_exons_gr), lengths(cryptic_segments_grl)),
+  lsv_exon_end = rep(end(lsv_exons_gr), lengths(cryptic_segments_grl)),
+  as_tibble(unlist(cryptic_segments_grl, use.names = FALSE))
+) |>
+  mutate(
+    across(c(seqnames, strand), as.character),
+    # Is the whole MAJIQ exon unannotated, or only part of it
+    # (alternative 5'/3' splice site extension)
+    cryptic_type = if_else(
+      start == lsv_exon_start & end == lsv_exon_end,
+      "full_exon", "partial_exon"
+    )
+  ) |>
+  filter(width >= min_cryptic_width)
+
+cryptic_per_lsv |>
+  count(cryptic_type)
+```
+
+Collapse identical cryptic segments shared between LSVs (the same exon is
+typically part of both a source and a target LSV). Each unique cryptic exon
+is annotated with the most changing LSV it belongs to.
+
+```{r}
+cryptic_exons <- cryptic_per_lsv |>
+  power_left_join(
+    lsv_max |>
+      select(
+        lsv_id, gene_name, gene_id, max_probability_changing, max_dpsi,
+        max_TDPneg_psi, max_TDPpos_psi, max_junction_coords,
+        max_junction_de_novo, any_de_novo_junction
+      ),
+    by = "lsv_id",
+    check = check_specs(
+      unmatched_keys_left = "abort",
+      duplicate_keys_right = "abort"
+    )
+  ) |>
+  group_by(seqnames, start, end, strand, width) |>
+  arrange(desc(max_probability_changing), desc(abs(max_dpsi))) |>
+  summarize(
+    n_lsvs = n_distinct(lsv_id),
+    lsv_ids = paste(unique(lsv_id), collapse = ";"),
+    gene_name = paste(unique(na.omit(gene_name)), collapse = ";"),
+    gene_id = paste(unique(gene_id), collapse = ";"),
+    cryptic_type = paste(sort(unique(cryptic_type)), collapse = ";"),
+    any_de_novo_junction = any(any_de_novo_junction),
+    best_lsv_id = first(lsv_id),
+    best_probability_changing = first(max_probability_changing),
+    best_dpsi = first(max_dpsi),
+    best_TDPneg_psi = first(max_TDPneg_psi),
+    best_TDPpos_psi = first(max_TDPpos_psi),
+    best_junction_coords = first(max_junction_coords),
+    best_junction_de_novo = first(max_junction_de_novo),
+    .groups = "drop"
+  ) |>
+  arrange(seqnames, start) |>
+  mutate(cryptic_id = paste0("cryptic_", row_number()), .before = 1)
+
+cryptic_exons
+
+cryptic_exons_gr <- cryptic_exons |>
+  select(cryptic_id, seqnames, start, end, strand) |>
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+
+p <- ggplot(cryptic_exons, aes(width)) +
+  geom_histogram(bins = 60) +
+  scale_x_log10() +
+  labs(x = "Cryptic exon segment width (bp)", y = "Count")
+
+ggsave(
+  file.path(out_dir, "liu_cryptic_exon_width_histogram.pdf"),
+  p, width = 6, height = 4
+)
+```
+
+## Overlap with RepeatMasker
+
+Strand-agnostic overlap, expression of TEs from either strand are interesting
+for dsRNA formation.
+
+```{r}
+te_hits <- findOverlaps(rmsk_gr, cryptic_exons_gr, ignore.strand = TRUE)
+
+te_cryptic_overlap <- tibble(
+  te_id = rmsk_gr$te_id[queryHits(te_hits)],
+  cryptic_id = cryptic_exons_gr$cryptic_id[subjectHits(te_hits)],
+  overlap_bp = width(
+    pintersect(
+      rmsk_gr[queryHits(te_hits)],
+      cryptic_exons_gr[subjectHits(te_hits)],
+      ignore.strand = TRUE
+    )
+  )
+) |>
+  power_inner_join(
+    rmsk |>
+      select(
+        te_id, seqnames, te_start = start, te_end = end, te_strand,
+        rep_name, class_family, rep_class, rep_family,
+        sw_score, perc_div, perc_del, perc_ins
+      ),
+    by = "te_id",
+    check = check_specs(duplicate_keys_right = "abort")
+  ) |>
+  power_inner_join(
+    cryptic_exons |>
+      rename(
+        cryptic_start = start, cryptic_end = end,
+        cryptic_strand = strand, cryptic_width = width
+      ),
+    by = c("cryptic_id", "seqnames"),
+    check = check_specs(duplicate_keys_right = "abort")
+  ) |>
+  mutate(
+    te_width = te_end - te_start + 1L,
+    # Fraction of the TE covered by the cryptic exon
+    frac_te_in_cryptic = overlap_bp / te_width,
+    # Fraction of the cryptic exon covered by the TE
+    frac_cryptic_in_te = overlap_bp / cryptic_width,
+    te_orientation = if_else(
+      te_strand == cryptic_strand, "sense", "antisense"
+    )
+  ) |>
+  group_by(te_id) |>
+  mutate(
+    n_cryptic_exons_overlapping_te = n_distinct(cryptic_id)
+  ) |>
+  group_by(cryptic_id) |>
+  mutate(
+    n_tes_overlapping_cryptic = n_distinct(te_id)
+  ) |>
+  ungroup() |>
+  relocate(
+    te_id, rep_name, class_family, seqnames, te_start, te_end, te_strand,
+    te_width, cryptic_id, cryptic_start, cryptic_end, cryptic_strand,
+    cryptic_width, overlap_bp, frac_te_in_cryptic, frac_cryptic_in_te,
+    te_orientation, n_cryptic_exons_overlapping_te, n_tes_overlapping_cryptic
+  ) |>
+  arrange(seqnames, te_start, cryptic_start)
+
+te_cryptic_overlap
+```
+
+
+```{r}
+cryptic_exons_annotated <- cryptic_exons |>
+  power_left_join(
+    te_cryptic_overlap |>
+      group_by(cryptic_id) |>
+      summarize(
+        n_repeats = n_distinct(te_id),
+        repeat_names = paste(unique(rep_name), collapse = ";"),
+        repeat_class_families = paste(unique(class_family), collapse = ";"),
+        .groups = "drop"
+      ),
+    by = "cryptic_id",
+    check = check_specs(duplicate_keys_right = "abort")
+  ) |>
+  replace_na(list(n_repeats = 0L))
+```
+
+```{r}
+te_cryptic_overlap |>
+  distinct(te_id, rep_class) |>
+  count(rep_class, sort = TRUE)
+
+p <- ggplot(
+  te_cryptic_overlap,
+  aes(frac_te_in_cryptic, frac_cryptic_in_te)
+) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  facet_wrap(~ rep_class) +
+  labs(
+    x = "Fraction of repeat in cryptic exon",
+    y = "Fraction of cryptic exon in repeat"
+  )
+
+ggsave(
+  file.path(out_dir, "liu_repeat_cryptic_overlap_fractions.pdf"),
+  p, width = 10, height = 8
+)
+```
+
+## Write output
+
+All tables are written to `data/cryptic_exon_te_overlap/`.
+
+- `lsv_max_junction.csv.gz`: one row per LSV. Holds the dPSI, PSI and
+  change probability of the LSV's most changing junction, plus gene, LSV type
+  and whether any of its junctions is de novo.
+- `cryptic_exons_per_lsv.csv.gz`: one row per cryptic segment per LSV
+  exon (many-to-many between LSVs and cryptic segments). An LSV can yield
+  several segments, and the same segment shows up once for every LSV that
+  contains its exon (e.g. both the source and the target LSV). Use it to go
+  from a cryptic exon back to all of its LSVs.
+- `cryptic_exons.csv.gz`: one row per unique cryptic exon
+  (`cryptic_id`), deduplicated across LSVs. Stats come from the most
+  changing LSV (`best_*`), and all contributing LSVs are listed in `lsv_ids`.
+  Summarizes the overlapping repeats (`n_repeats`, `repeat_names`,
+  `repeat_class_families`); `n_repeats = 0` means no overlap.
+- `repeat_cryptic_exon_overlap.csv.gz`: one row per overlapping
+  (repeat, cryptic exon) pair (many-to-many). Contains only repeats that
+  overlap a cryptic exon, and strand is ignored. A repeat that spans several
+  cryptic exons appears once per exon (`n_cryptic_exons_overlapping_te`), and
+  a cryptic exon covered by several repeats appears once per repeat
+  (`n_tes_overlapping_cryptic`). Includes the overlap in bp, the fraction of
+  each element that is covered, and the repeat orientation relative to the
+  exon (sense/antisense).
+
+```{r}
+write_csv(
+  lsv_max |>
+    select(-exons_coords),
+  file.path(out_dir, "liu_lsv_max_junction.csv.gz")
+)
+
+write_csv(
+  cryptic_per_lsv,
+  file.path(out_dir, "liu_cryptic_exons_per_lsv.csv.gz")
+)
+
+write_csv(
+  cryptic_exons_annotated,
+  file.path(out_dir, "liu_cryptic_exons.csv.gz")
+)
+
+write_csv(
+  te_cryptic_overlap,
+  file.path(out_dir, "liu_repeat_cryptic_exon_overlap.csv.gz")
+)
+```
+
+## Write to Synapse
+
+```{r}
+syn_te_overlap <- synMkdir(
+  "syn36639264", "RNA-seq", "Repeats"
+)
+
+synStoreMany(
+  file.path(
+    out_dir,
+    c(
+      "liu_lsv_max_junction.csv.gz",
+      "liu_cryptic_exons_per_lsv.csv.gz",
+      "liu_cryptic_exons.csv.gz",
+      "liu_repeat_cryptic_exon_overlap.csv.gz"
+    )
+  ),
+  parentId = syn_te_overlap,
+  forceVersion = FALSE
+)
+```
